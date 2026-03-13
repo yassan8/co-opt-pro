@@ -2414,6 +2414,7 @@ export default function App() {
     const runOptimize = async () => {
       if (optRunning) return;
       const w = window as any;
+      const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
       const hostWindow = (() => {
         try {
           const op = (window as any).opener;
@@ -2587,6 +2588,34 @@ export default function App() {
           variableCount: 0,
         }));
         return;
+      }
+
+      // Tauri-only startup stabilization: focus Render window before optimizer starts.
+      // This follows the user's requested flow and helps avoid first-accept redraw lag.
+      if (isTauriRuntime() && optAutoRenderOnAccept) {
+        try {
+          const openRender = (hostWindow as any).__cooptOpenRenderWindow || (window as any).__cooptOpenRenderWindow;
+          if (typeof openRender === 'function') {
+            await Promise.resolve(openRender());
+          } else if (typeof (hostWindow as any).handleRender3D === 'function') {
+            (hostWindow as any).handleRender3D();
+          }
+        } catch (_) {}
+
+        try {
+          const mod = await import('@tauri-apps/api/window');
+          const all = (mod && typeof (mod as any).getAllWindows === 'function')
+            ? await (mod as any).getAllWindows()
+            : [];
+          const renderWin = Array.isArray(all)
+            ? all.find((win: any) => String(win?.label || '') === 'render-window')
+            : null;
+          if (renderWin && typeof renderWin.setFocus === 'function') {
+            await renderWin.setFocus();
+          }
+        } catch (_) {}
+
+        try { await sleep(140); } catch (_) {}
       }
 
       (window as any).__cooptOptimizeStopRequested = false;
