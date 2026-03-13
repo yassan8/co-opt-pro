@@ -16,7 +16,8 @@ import { getOpticalSystemRows, getObjectRows, getSourceRows } from '../utils/dat
 import { expandBlocksToOpticalSystemRows } from '../data/block-schema.ts';
 import { loadSystemConfigurations } from '../data/table-configuration.ts';
 import { loadTableData as loadSourceTableData } from '../data/table-source.ts';
-import { detectConjugateType, ConjugateType } from '../utils/conjugate-detection.ts';
+import { detectConjugateType } from '../utils/conjugate-detection.ts';
+import { generateRayStartPointsForObject } from '../optical/ray-renderer.ts';
 import { getSpotDiagramPattern, loadSpotDiagramSettingsByConfigId, saveSpotDiagramSettingsByConfigId, saveLastSpotDiagramSettings } from '../ui/spot-diagram-settings-storage.ts';
 import { getScene, getCamera, getRenderer, getControls, getTableOpticalSystem, getTableObject, getTableSource,
          getIsGeneratingSpotDiagram, getIsGeneratingTransverseAberration,
@@ -26,12 +27,15 @@ const console = globalThis.console as Console;
 
 let spotDiagramRequestCounter = 0;
 let pendingSpotDiagramRequest: { requestId: number; options: any; requestedAt: number } | null = null;
-let analysisRustTraceOptionsCache: { options: any; at: number } | null = null;
+let analysisRustTraceOptionsCache: { options: any; at: number; forceKey: string } | null = null;
 let analysisRustTraceOptionsPromise: Promise<any | null> | null = null;
 
-async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
+async function resolveAnalysisRustTraceOptions(options: { forceRustWasm?: boolean; requireRustWasm?: boolean } = {}): Promise<any | null> {
+    const forceRustWasm = options.forceRustWasm === true;
+    const requireRustWasmFromCaller = options.requireRustWasm === true;
+    const forceKey = `${forceRustWasm ? 'force' : 'auto'}:${requireRustWasmFromCaller ? 'require' : 'allow'}`;
     const now = Date.now();
-    if (analysisRustTraceOptionsCache && (now - analysisRustTraceOptionsCache.at) < 3000) {
+    if (analysisRustTraceOptionsCache && analysisRustTraceOptionsCache.forceKey === forceKey && (now - analysisRustTraceOptionsCache.at) < 3000) {
         return analysisRustTraceOptionsCache.options;
     }
 
@@ -40,7 +44,16 @@ async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
     }
 
     analysisRustTraceOptionsPromise = (async () => {
+        const allowTsFallback = (() => {
+            try {
+                return typeof window !== 'undefined' && (window as any).__COOPT_ALLOW_TS_ANALYSIS_FALLBACK === true;
+            } catch (_) {
+                return false;
+            }
+        })();
         const preferRustWasm = (() => {
+            if (forceRustWasm) return true;
+            if (!allowTsFallback) return true;
             try {
                 return !(typeof window !== 'undefined' && (window as any).__COOPT_DISABLE_RUST_WASM_ANALYSIS === true);
             } catch (_) {
@@ -48,6 +61,8 @@ async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
             }
         })();
         const requireRustWasm = (() => {
+            if (!allowTsFallback) return true;
+            if (requireRustWasmFromCaller) return true;
             try {
                 return typeof window !== 'undefined' && (window as any).__COOPT_REQUIRE_RUST_WASM_ANALYSIS === true;
             } catch (_) {
@@ -56,7 +71,7 @@ async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
         })();
 
         if (!preferRustWasm) {
-            analysisRustTraceOptionsCache = { options: null, at: Date.now() };
+            analysisRustTraceOptionsCache = { options: null, at: Date.now(), forceKey };
             return null;
         }
 
@@ -72,11 +87,12 @@ async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
                 try {
                     (window as any).__COOPT_LAST_ANALYSIS_BACKEND = {
                         kind: 'rust-wasm',
+                        forced: forceRustWasm,
                         at: Date.now()
                     };
                     console.warn('🧭 [Analysis Backend] Rust-WASM');
                 } catch (_) {}
-                analysisRustTraceOptionsCache = { options, at: Date.now() };
+                analysisRustTraceOptionsCache = { options, at: Date.now(), forceKey };
                 return options;
             }
 
@@ -90,11 +106,12 @@ async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
                 (window as any).__COOPT_LAST_ANALYSIS_BACKEND = {
                     kind: 'js',
                     detail: errorDetail || 'Rust WASM unavailable',
+                    forced: forceRustWasm,
                     at: Date.now()
                 };
                 console.warn(`🧭 [Analysis Backend] JavaScript fallback${errorDetail ? ` (${errorDetail})` : ''}`);
             } catch (_) {}
-            analysisRustTraceOptionsCache = { options: null, at: Date.now() };
+            analysisRustTraceOptionsCache = { options: null, at: Date.now(), forceKey };
             return null;
         } catch (error: any) {
             if (requireRustWasm) {
@@ -105,11 +122,12 @@ async function resolveAnalysisRustTraceOptions(): Promise<any | null> {
                 (window as any).__COOPT_LAST_ANALYSIS_BACKEND = {
                     kind: 'js',
                     detail,
+                    forced: forceRustWasm,
                     at: Date.now()
                 };
                 console.warn(`🧭 [Analysis Backend] JavaScript fallback (${detail})`);
             } catch (_) {}
-            analysisRustTraceOptionsCache = { options: null, at: Date.now() };
+            analysisRustTraceOptionsCache = { options: null, at: Date.now(), forceKey };
             return null;
         }
     })();
@@ -226,6 +244,13 @@ export function clearAllDrawing(): void {
  * Show spot diagram
  */
 export async function showSpotDiagram(options: any = {}): Promise<void> {
+        const forceRustWasmTrace = (options && typeof options === 'object')
+            ? options.forceRustWasmTrace === true
+            : false;
+        const requireRustWasmTrace = (options && typeof options === 'object')
+            ? options.requireRustWasmTrace === true
+            : false;
+
     console.log('🎯 Starting spot diagram generation...');
 
     const nowMs = () => {
@@ -316,6 +341,16 @@ export async function showSpotDiagram(options: any = {}): Promise<void> {
         try { onProgress?.({ percent: 0, message: 'Preparing spot diagram...' }); } catch (_) {}
         
         const providedSurfaceIndex = Number.isInteger(options?.surfaceIndex) ? options.surfaceIndex : null;
+        const providedSurfaceRowIndex = Number.isInteger(options?.surfaceRowIndex) ? options.surfaceRowIndex : null;
+        const providedSurfaceRowId = (options && typeof options === 'object' && options.surfaceRowId !== undefined && options.surfaceRowId !== null)
+            ? String(options.surfaceRowId).trim()
+            : '';
+        const providedSurfaceRowSig = (options && typeof options === 'object' && options.surfaceRowSig !== undefined && options.surfaceRowSig !== null)
+            ? String(options.surfaceRowSig).trim()
+            : '';
+        const providedSurfaceIsImage = (options && typeof options === 'object')
+            ? options.surfaceIsImage === true
+            : false;
         const providedRayCount = Number.isInteger(options?.rayCount) ? options.rayCount : null;
         const providedWavelengthNm = Number.isFinite(options?.wavelengthNm) ? options.wavelengthNm : null;
         const providedRingCount = Number.isInteger(options?.ringCount) ? options.ringCount : null;
@@ -975,9 +1010,93 @@ export async function showSpotDiagram(options: any = {}): Promise<void> {
         // Resolve CB-invariant surfaceId -> actual rowIndex in opticalSystemRows.
         // Use separated functions for finite and infinite conjugates to prevent mutual interference.
         let resolvedSurfaceRowIndex: number | null = null;
+        const buildRowSig = (row: any): string => {
+            try {
+                const norm = (v: any) => String(v ?? '').trim().toLowerCase();
+                const n0 = (v: any) => {
+                    const x = Number(v);
+                    return Number.isFinite(x) ? String(x) : norm(v);
+                };
+                const objTypeRaw = row?.['object type'] ?? row?.objectType ?? row?.object ?? '';
+                const surfTypeRaw = row?.surfType ?? row?.['surf type'] ?? row?.type ?? '';
+                const surfaceType = objTypeRaw || surfTypeRaw || 'Standard';
+                return [
+                    `t:${norm(surfaceType)}`,
+                    `r:${n0(row?.radius ?? row?.R ?? '')}`,
+                    `th:${n0(row?.thickness ?? row?.T ?? '')}`,
+                    `sd:${n0(row?.semidia ?? row?.semiDia ?? '')}`,
+                    `m:${norm(row?.material ?? row?.glass ?? row?.['glass'] ?? row?.refractiveIndex ?? '')}`,
+                    `c:${norm(row?.comment ?? row?.name ?? '')}`
+                ].join('|');
+            } catch (_) {
+                return '';
+            }
+        };
+        if (providedSurfaceRowId) {
+            const idxById = Array.isArray(opticalSystemRows)
+                ? opticalSystemRows.findIndex((row: any) => row && row.id !== undefined && row.id !== null && String(row.id) === providedSurfaceRowId)
+                : -1;
+            if (Number.isInteger(idxById) && idxById >= 0) {
+                resolvedSurfaceRowIndex = idxById;
+                console.log(`✅ [Surface Resolution] Using explicit surfaceRowId=${providedSurfaceRowId} -> rowIndex=${resolvedSurfaceRowIndex}`);
+            } else {
+                console.warn(`⚠️ [Surface Resolution] surfaceRowId=${providedSurfaceRowId} not found in current rows`);
+            }
+        }
+        if (resolvedSurfaceRowIndex === null && providedSurfaceRowSig) {
+            const idxBySig = Array.isArray(opticalSystemRows)
+                ? opticalSystemRows.findIndex((row: any) => buildRowSig(row) === providedSurfaceRowSig)
+                : -1;
+            if (Number.isInteger(idxBySig) && idxBySig >= 0) {
+                resolvedSurfaceRowIndex = idxBySig;
+                console.log(`✅ [Surface Resolution] Using explicit surfaceRowSig -> rowIndex=${resolvedSurfaceRowIndex}`);
+            } else {
+                console.warn('⚠️ [Surface Resolution] surfaceRowSig not found in current rows');
+            }
+        }
+        if (Number.isInteger(providedSurfaceRowIndex) && providedSurfaceRowIndex !== null) {
+            if (providedSurfaceRowIndex >= 0 && providedSurfaceRowIndex < opticalSystemRows.length) {
+                if (resolvedSurfaceRowIndex === null) {
+                    resolvedSurfaceRowIndex = providedSurfaceRowIndex;
+                    console.log(`✅ [Surface Resolution] Using explicit surfaceRowIndex=${resolvedSurfaceRowIndex}`);
+                }
+            } else {
+                console.warn(`⚠️ [Surface Resolution] Ignoring out-of-range surfaceRowIndex=${providedSurfaceRowIndex} (rows=${opticalSystemRows.length})`);
+            }
+        }
+
+        if (resolvedSurfaceRowIndex === null && providedSurfaceIsImage) {
+            const idxImage = Array.isArray(opticalSystemRows)
+                ? opticalSystemRows.findIndex((row: any) => {
+                    const objTypeRaw = String(row?.['object type'] ?? row?.objectType ?? row?.object ?? '').toLowerCase();
+                    const surfTypeRaw = String(row?.surfType ?? row?.['surf type'] ?? row?.type ?? '').toLowerCase();
+                    return objTypeRaw.includes('image') || surfTypeRaw.includes('image');
+                })
+                : -1;
+            if (Number.isInteger(idxImage) && idxImage >= 0) {
+                resolvedSurfaceRowIndex = idxImage;
+                console.log(`✅ [Surface Resolution] Using explicit Image selection -> rowIndex=${resolvedSurfaceRowIndex}`);
+            } else {
+                console.warn('⚠️ [Surface Resolution] Explicit Image selection requested but no Image row found');
+            }
+        }
         try {
             const { generateSurfaceOptions } = await import('../evaluation/spot-diagram.js');
             const opts = generateSurfaceOptions(opticalSystemRows || []);
+
+            if (providedSurfaceIsImage && Array.isArray(opts) && opts.length > 0) {
+                const imageOpt = opts.find((o: any) => {
+                    const label = String(o?.label ?? '').toLowerCase();
+                    return label.includes('(image)') || label.includes(' image');
+                });
+                if (imageOpt && Number.isInteger(imageOpt.rowIndex)) {
+                    resolvedSurfaceRowIndex = imageOpt.rowIndex;
+                    console.log(`✅ [Surface Resolution] Explicit Image selection mapped via options -> rowIndex=${resolvedSurfaceRowIndex} (${imageOpt.label})`);
+                } else if (Number.isInteger(opts[opts.length - 1]?.rowIndex)) {
+                    resolvedSurfaceRowIndex = opts[opts.length - 1].rowIndex;
+                    console.warn(`⚠️ [Surface Resolution] Explicit Image selection fallback -> last option rowIndex=${resolvedSurfaceRowIndex}`);
+                }
+            }
             
             // Detect conjugate type using unified detection
             const conjugateType = detectConjugateType(opticalSystemRows);
@@ -1010,7 +1129,9 @@ export async function showSpotDiagram(options: any = {}): Promise<void> {
                 return null;
             };
 
-            resolvedSurfaceRowIndex = resolveSurfaceRowIndex();
+            if (resolvedSurfaceRowIndex === null) {
+                resolvedSurfaceRowIndex = resolveSurfaceRowIndex();
+            }
             
             if (Number.isInteger(resolvedSurfaceRowIndex)) {
                 console.log(`✅ [Surface Resolution] ${conjugateType} resolved: surfaceId=${surfaceId} → rowIndex=${resolvedSurfaceRowIndex}`);
@@ -1129,7 +1250,10 @@ export async function showSpotDiagram(options: any = {}): Promise<void> {
         
         const surfaceNumber = surfaceIndex + 1;
         const backendResolveStartMs = nowMs();
-        const analysisTraceOptions = await resolveAnalysisRustTraceOptions();
+        const analysisTraceOptions = await resolveAnalysisRustTraceOptions({
+            forceRustWasm: forceRustWasmTrace,
+            requireRustWasm: requireRustWasmTrace,
+        });
         spotProfile.timingsMs.resolveBackend = Math.max(0, nowMs() - backendResolveStartMs);
         spotProfile.backend = (() => {
             try {
@@ -1501,7 +1625,8 @@ export async function showThroughFocusSpotDiagram(options: any = {}): Promise<vo
         const wavelengthModeRaw = String(options?.wavelengthMode || 'all').trim().toLowerCase();
         const wavelengthMode: 'all' | 'primary' = (wavelengthModeRaw === 'primary') ? 'primary' : 'all';
 
-        const { generateSurfaceOptions, generateSpotDiagramAsync } = await import('../evaluation/spot-diagram.js');
+        const { generateSurfaceOptions } = await import('../evaluation/spot-diagram.js');
+        const { runNativeSpotRaytrace } = await import('../src/desktop/ipc/client.ts');
 
         const surfaceOptions = generateSurfaceOptions(baseOpticalSystemRows || []);
         let surfaceIndex = 0;
@@ -1554,12 +1679,55 @@ export async function showThroughFocusSpotDiagram(options: any = {}): Promise<vo
             ? (primaryWavelengthRow ? [primaryWavelengthRow] : [{ wavelength: 0.5876, weight: 1, __isPrimary: true, __label: '587.6 nm (primary)' }])
             : (wavelengthRows.length > 0 ? wavelengthRows : [{ wavelength: 0.5876, weight: 1, __isPrimary: true, __label: '587.6 nm (primary)' }]);
 
+        const getObjectLabel = (row: any, index: number) => {
+            const id = row && row.id !== undefined ? String(row.id).trim() : '';
+            if (id) return id;
+            const obj = row && row.object !== undefined ? String(row.object).trim() : '';
+            if (obj) return obj;
+            const pos = row && row.position !== undefined ? String(row.position).trim() : '';
+            if (pos) return `Object ${index + 1} (${pos})`;
+            return `Object ${index + 1}`;
+        };
+        const toWavelengthLabel = (rawLabel: any) => {
+            const text = String(rawLabel || '').trim();
+            const nm = text.match(/(\d+(?:\.\d+)?)\s*nm/i);
+            if (nm && nm[1]) return `Wavelength ${nm[1]}nm`;
+            const lower = text.toLowerCase();
+            if (lower.includes('primary')) return 'Wavelength Primary';
+            return `Wavelength ${text}`;
+        };
+        const wavelengthLabelFromSeries = (seriesItem: any, rawLabel: any) => {
+            const wl = Number(seriesItem?.wavelengthUm);
+            if (Number.isFinite(wl) && wl > 0) {
+                return `Wavelength ${(wl * 1000).toFixed(1)}nm`;
+            }
+            return toWavelengthLabel(rawLabel);
+        };
+        const parseSeriesLabel = (label: any, fallbackObjectLabel: string) => {
+            const raw = String(label || '').trim();
+            if (!raw) {
+                return { objectLabel: fallbackObjectLabel, wavelengthLabel: 'Wavelength Primary' };
+            }
+            const m = raw.match(/(Primary(?:\s*\([^)]*\))?|\d+(?:\.\d+)?\s*nm)\s*$/i);
+            if (m && m[1]) {
+                const wlRaw = String(m[1] || 'Primary');
+                const prefix = raw.slice(0, Math.max(0, m.index || 0)).replace(/[|@\-\s]+$/, '').trim();
+                return {
+                    objectLabel: prefix || fallbackObjectLabel,
+                    wavelengthLabel: toWavelengthLabel(wlRaw),
+                };
+            }
+            return { objectLabel: raw, wavelengthLabel: 'Wavelength Primary' };
+        };
+        const objectLabels = objectRows.map((row: any, index: number) => getObjectLabel(row, index));
+        const objectLabelToIndex = new Map<string, number>(objectLabels.map((label: string, index: number) => [label, index]));
+
         const focusGrid: any[][] = Array.from({ length: objectRows.length }, () => []);
+        const tfTraceStatsRows: any[] = [];
         const patternFromOption = String(options?.pattern || '').trim().toLowerCase();
         const pattern = (patternFromOption === 'grid' || patternFromOption === 'annular')
             ? patternFromOption
             : getSpotDiagramPattern();
-        const analysisTraceOptions = await resolveAnalysisRustTraceOptions();
 
         for (let i = 0; i < defocusValues.length; i++) {
             const shift = defocusValues[i];
@@ -1567,92 +1735,161 @@ export async function showThroughFocusSpotDiagram(options: any = {}): Promise<vo
             reportProgress(p, `Defocus ${shift.toFixed(4)} mm (${i + 1}/${defocusValues.length})`);
 
             const shiftedRows = cloneOpticalSystemRowsWithDefocusShift(baseOpticalSystemRows, shift);
+            const raySeries: any[] = [];
             for (let objIdx = 0; objIdx < objectRows.length; objIdx++) {
                 const objectRow = objectRows[objIdx] || {};
-                const objectTypeRaw = String(objectRow.position ?? objectRow.object ?? objectRow.Object ?? objectRow.objectType ?? 'Angle');
-                const objectTypeLower = objectTypeRaw.toLowerCase();
-                const isFiniteObject = !objectTypeLower.includes('angle');
-
-                const mergedRawPoints: Array<{ x: number; y: number }> = [];
-                const perWavelengthRaw: Array<{ key: string; label: string; color: string; points: Array<{ x: number; y: number }> }> = [];
-
+                const objectLabel = objectLabels[objIdx] || getObjectLabel(objectRow, objIdx);
+                const hasFieldAngle = String(objectRow.position ?? objectRow.object ?? objectRow.Object ?? '').trim().toLowerCase() === 'angle';
                 for (let wlIdx = 0; wlIdx < effectiveWavelengthRows.length; wlIdx++) {
                     const wlRow = effectiveWavelengthRows[wlIdx];
                     const wlValueUm = Number(wlRow?.wavelength);
-                    const wlColor = getColorForWavelength(wlValueUm);
-                    const wlLabel = String(wlRow.__label || `${(Number(wlRow.wavelength) * 1000).toFixed(1)} nm`);
-                    reportProgress(
-                        p,
-                        `Defocus ${shift.toFixed(4)} mm (${i + 1}/${defocusValues.length}), λ ${wlIdx + 1}/${effectiveWavelengthRows.length}`
-                    );
-
-                    const spotResult = await generateSpotDiagramAsync(
+                    const wlLabel = String(wlRow?.__label || `${(wlValueUm * 1000).toFixed(1)} nm`);
+                    const starts = generateRayStartPointsForObject(
+                        objectRow,
                         shiftedRows,
-                        [wlRow],
-                        [objectRow], // Pass single object like MTF does
-                        surfaceNumber,
                         rayCount,
-                        ringCount,
+                        null,
                         {
-                            onProgress: null,
-                            physicalVignetting: true,
-                            displaySurfaceNumber: surfaceId,
+                            annularRingCount: ringCount,
+                            wavelengthUm: wlValueUm,
                             pattern,
-                            conjugateType: isFiniteObject ? 'finite' : 'infinite',
-                            // For Through-Focus with infinite conjugate, disable origin solving
-                            // since defocus shifts can confuse the chief ray calculation
-                            allowStopBasedOriginSolve: false,
-                            traceOptions: analysisTraceOptions
-                        }
+                        } as any,
                     );
+                    const rays = (Array.isArray(starts) ? starts : [])
+                        .map((start: any) => ({
+                            startP: {
+                                x: Number(start?.startP?.x) || 0,
+                                y: Number(start?.startP?.y) || 0,
+                                z: Number(start?.startP?.z) || 0,
+                            },
+                            dir: {
+                                x: Number(start?.dir?.x) || 0,
+                                y: Number(start?.dir?.y) || 0,
+                                z: Number(start?.dir?.z) || 1,
+                            },
+                            wavelengthUm: wlValueUm,
+                            pupilU: Number.isFinite(Number(start?.planeCoords?.u)) ? Number(start.planeCoords.u) : undefined,
+                            pupilV: Number.isFinite(Number(start?.planeCoords?.v)) ? Number(start.planeCoords.v) : undefined,
+                            isChief: start?.isChief === true || (start?.isChief == null && (start?.rayIndex === 0 || start?.index === 0)),
+                        }))
+                        .filter((ray: any) => Number.isFinite(ray.startP.x) && Number.isFinite(ray.startP.y) && Number.isFinite(ray.startP.z));
 
-                    console.log(`🔍 [TFSD] Spot result for defocus ${shift.toFixed(4)} mm, wl ${wlLabel}, obj ${objIdx}:`, {
-                        spotDataLength: spotResult?.spotData?.length,
-                        firstObjPointCount: spotResult?.spotData?.[0]?.spotPoints?.length
+                    if (rays.length === 0) continue;
+
+                    raySeries.push({
+                        label: `${objectLabel} ${wlLabel}`,
+                        color: getColorForWavelength(wlValueUm),
+                        hasFieldAngle,
+                        rays,
                     });
+                }
+            }
 
-                    const objects = Array.isArray(spotResult?.spotData) ? spotResult.spotData : [];
-                    const objData = objects[0] || {}; // Always use index 0 since we passed single object
-                    const points = Array.isArray(objData?.spotPoints) ? objData.spotPoints : [];
+            const spotResult = await runNativeSpotRaytrace({
+                opticalSystemRows: shiftedRows,
+                sourceRows: effectiveWavelengthRows,
+                objectRows,
+                surfaceIndex,
+                rayCount,
+                ringCount,
+                pattern,
+                wavelengthMode,
+                raySeries,
+            } as any);
 
-                    const wlPoints: Array<{ x: number; y: number }> = [];
+            const perSeriesStats = Array.isArray((spotResult as any)?.seriesStats) ? (spotResult as any).seriesStats : [];
+            for (const stat of perSeriesStats) {
+                tfTraceStatsRows.push({
+                    backend: String((spotResult as any)?.backend || 'unknown'),
+                    defocusMm: Number(shift),
+                    label: String((stat as any)?.label || ''),
+                    attemptedRays: Number((stat as any)?.attemptedRays || 0),
+                    hitRays: Number((stat as any)?.hitRays || 0),
+                    missRays: Number((stat as any)?.missRays || 0),
+                    apertureBlockRays: Number((stat as any)?.apertureBlockRays || 0),
+                    noIntersectionRays: Number((stat as any)?.noIntersectionRays || 0),
+                    tirRays: Number((stat as any)?.tirRays || 0),
+                    unknownFailRays: Number((stat as any)?.unknownFailRays || 0),
+                    statusCounts: (((stat as any) && typeof (stat as any).statusCounts === 'object' && !Array.isArray((stat as any).statusCounts)) ? (stat as any).statusCounts : {}),
+                    hitRatePercent: Number((stat as any)?.hitRatePercent || 0),
+                });
+            }
 
-                    for (const pt of points) {
-                        const x = Number(pt?.x || 0);
-                        const y = Number(pt?.y || 0);
-                        mergedRawPoints.push({ x, y });
-                        wlPoints.push({ x, y });
+            const groupedByObject = new Map<number, Array<{ key: string; label: string; color: string; points: Array<{ xUm: number; yUm: number }> }>>();
+            const series = Array.isArray(spotResult?.series) ? spotResult.series : [];
+            const wavelengthCount = Math.max(1, effectiveWavelengthRows.length);
+
+            for (let sIdx = 0; sIdx < series.length; sIdx++) {
+                const seriesItem = series[sIdx] || {};
+                const objectIndexByOrder = Math.floor(sIdx / wavelengthCount);
+                const fallbackObjectLabel = objectLabels[objectIndexByOrder] || `Object ${objectIndexByOrder + 1}`;
+                const parsed = parseSeriesLabel(seriesItem?.label, fallbackObjectLabel);
+                const resolvedObjectIndex = objectLabelToIndex.has(parsed.objectLabel)
+                    ? Number(objectLabelToIndex.get(parsed.objectLabel))
+                    : Math.max(0, Math.min(objectRows.length - 1, objectIndexByOrder));
+                const wlLabel = wavelengthLabelFromSeries(seriesItem, parsed.wavelengthLabel);
+                const points = (Array.isArray(seriesItem?.points) ? seriesItem.points : [])
+                    .map((point: any) => ({
+                        xUm: Number(point?.xUm),
+                        yUm: Number(point?.yUm),
+                    }))
+                    .filter((point: any) => Number.isFinite(point.xUm) && Number.isFinite(point.yUm));
+                if (!groupedByObject.has(resolvedObjectIndex)) {
+                    groupedByObject.set(resolvedObjectIndex, []);
+                }
+                groupedByObject.get(resolvedObjectIndex)!.push({
+                    key: wlLabel,
+                    label: wlLabel,
+                    color: String(seriesItem?.color || getColorForWavelength(Number(seriesItem?.wavelengthUm))),
+                    points,
+                });
+            }
+
+            for (let objIdx = 0; objIdx < objectRows.length; objIdx++) {
+                const groups = Array.isArray(groupedByObject.get(objIdx)) ? groupedByObject.get(objIdx)! : [];
+                const mergedPoints: Array<{ xUm: number; yUm: number }> = [];
+                for (const group of groups) {
+                    const pts = Array.isArray(group?.points) ? group.points : [];
+                    for (const point of pts) {
+                        mergedPoints.push({ xUm: Number(point?.xUm) || 0, yUm: Number(point?.yUm) || 0 });
                     }
-
-                    perWavelengthRaw.push({
-                        key: wlLabel,
-                        label: wlLabel,
-                        color: wlColor,
-                        points: wlPoints
-                    });
                 }
 
                 let cx = 0;
                 let cy = 0;
-                if (mergedRawPoints.length > 0) {
-                    cx = mergedRawPoints.reduce((sum, pt) => sum + pt.x, 0) / mergedRawPoints.length;
-                    cy = mergedRawPoints.reduce((sum, pt) => sum + pt.y, 0) / mergedRawPoints.length;
+                if (mergedPoints.length > 0) {
+                    cx = mergedPoints.reduce((sum, point) => sum + point.xUm, 0) / mergedPoints.length;
+                    cy = mergedPoints.reduce((sum, point) => sum + point.yUm, 0) / mergedPoints.length;
                 }
 
                 focusGrid[objIdx].push({
                     shiftMm: shift,
-                    pointsByWavelength: perWavelengthRaw.map((group) => ({
+                    pointsByWavelength: groups.map((group) => ({
                         key: group.key,
                         label: group.label,
                         color: group.color,
-                        points: group.points.map((pt) => ({
-                            xUm: (pt.x - cx) * 1000,
-                            yUm: (pt.y - cy) * 1000
-                        }))
-                    }))
+                        points: (Array.isArray(group.points) ? group.points : []).map((point) => ({
+                            xUm: (Number(point?.xUm) || 0) - cx,
+                            yUm: (Number(point?.yUm) || 0) - cy,
+                        })),
+                    })),
                 });
             }
         }
+
+        try {
+            (w as any).__cooptTfSpotLastTraceStats = tfTraceStatsRows;
+        } catch (_) {}
+        try {
+            (globalThis as any).__cooptTfSpotLastTraceStats = tfTraceStatsRows;
+        } catch (_) {}
+        try {
+            if (console.table) {
+                console.table(tfTraceStatsRows);
+            } else {
+                console.log('[TFSD_TRACE_STATS]', tfTraceStatsRows);
+            }
+        } catch (_) {}
 
         const containerEl = (typeof containerTarget === 'string')
             ? document.getElementById(containerTarget)
@@ -1788,10 +2025,454 @@ export async function showThroughFocusSpotDiagram(options: any = {}): Promise<vo
     }
 }
 
+export async function runSpotParityDiagnostics(options: any = {}): Promise<any> {
+    const parseIntOr = (v: any, fallback: number) => {
+        const n = parseInt(String(v ?? ''), 10);
+        return Number.isInteger(n) ? n : fallback;
+    };
+    const parseFloatOr = (v: any, fallback: number) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : fallback;
+    };
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+    const normalizePointsUm = (points: any[]) => {
+        const raw = Array.isArray(points)
+            ? points
+                .map((pt: any) => ({ x: Number(pt?.x), y: Number(pt?.y) }))
+                .filter((pt: any) => Number.isFinite(pt.x) && Number.isFinite(pt.y))
+            : [];
+
+        if (raw.length === 0) {
+            return [] as Array<{ xUm: number; yUm: number }>;
+        }
+
+        const cx = raw.reduce((sum: number, pt: any) => sum + pt.x, 0) / raw.length;
+        const cy = raw.reduce((sum: number, pt: any) => sum + pt.y, 0) / raw.length;
+        return raw.map((pt: any) => ({
+            xUm: (pt.x - cx) * 1000,
+            yUm: (pt.y - cy) * 1000,
+        }));
+    };
+
+    const metricFromPointsUm = (points: Array<{ xUm: number; yUm: number }>) => {
+        if (!Array.isArray(points) || points.length === 0) {
+            return { count: 0, rmsUm: NaN, diaUm: NaN };
+        }
+
+        const rsq = points.map((pt) => pt.xUm * pt.xUm + pt.yUm * pt.yUm);
+        const maxR = Math.sqrt(Math.max(...rsq));
+        const meanRsq = rsq.reduce((s, v) => s + v, 0) / rsq.length;
+        return {
+            count: points.length,
+            rmsUm: Math.sqrt(meanRsq),
+            diaUm: 2 * maxR,
+        };
+    };
+
+    const resultTableFromMaps = (
+        tsMap: Map<string, any>,
+        rustMap: Map<string, any>,
+    ) => {
+        const keys = Array.from(new Set<string>([
+            ...Array.from(tsMap.keys()),
+            ...Array.from(rustMap.keys()),
+        ])).sort();
+
+        return keys.map((key) => {
+            const t = tsMap.get(key) || {};
+            const r = rustMap.get(key) || {};
+            const tsRms = Number(t.rmsUm);
+            const rustRms = Number(r.rmsUm);
+            const tsDia = Number(t.diaUm);
+            const rustDia = Number(r.diaUm);
+            return {
+                key,
+                tsCount: Number(t.count || 0),
+                rustCount: Number(r.count || 0),
+                tsRmsUm: tsRms,
+                rustRmsUm: rustRms,
+                deltaRmsUm: Number.isFinite(tsRms) && Number.isFinite(rustRms) ? (rustRms - tsRms) : NaN,
+                tsDiaUm: tsDia,
+                rustDiaUm: rustDia,
+                deltaDiaUm: Number.isFinite(tsDia) && Number.isFinite(rustDia) ? (rustDia - tsDia) : NaN,
+            };
+        });
+    };
+
+    const finiteNumber = (v: any) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    };
+
+    const computeSummary = (rows: any[]) => {
+        const rmsAbs = (rows || [])
+            .map((r: any) => finiteNumber(r?.deltaRmsUm))
+            .filter((v: any) => v !== null)
+            .map((v: number) => Math.abs(v));
+        const diaAbs = (rows || [])
+            .map((r: any) => finiteNumber(r?.deltaDiaUm))
+            .filter((v: any) => v !== null)
+            .map((v: number) => Math.abs(v));
+        const rmsSigned = (rows || [])
+            .map((r: any) => finiteNumber(r?.deltaRmsUm))
+            .filter((v: any) => v !== null);
+        const diaSigned = (rows || [])
+            .map((r: any) => finiteNumber(r?.deltaDiaUm))
+            .filter((v: any) => v !== null);
+
+        const mean = (arr: number[]) => arr.length > 0 ? (arr.reduce((s, v) => s + v, 0) / arr.length) : NaN;
+        const max = (arr: number[]) => arr.length > 0 ? Math.max(...arr) : NaN;
+
+        return {
+            rowCount: (rows || []).length,
+            meanAbsDeltaRmsUm: mean(rmsAbs),
+            maxAbsDeltaRmsUm: max(rmsAbs),
+            meanAbsDeltaDiaUm: mean(diaAbs),
+            maxAbsDeltaDiaUm: max(diaAbs),
+            signedMeanDeltaRmsUm: mean(rmsSigned),
+            signedMeanDeltaDiaUm: mean(diaSigned),
+        };
+    };
+
+    const topHotspots = (rows: any[], deltaField: 'deltaRmsUm' | 'deltaDiaUm', topN: number) => {
+        const picked = (rows || [])
+            .map((r: any) => ({ ...r, __abs: Math.abs(Number(r?.[deltaField])) }))
+            .filter((r: any) => Number.isFinite(r.__abs))
+            .sort((a: any, b: any) => b.__abs - a.__abs)
+            .slice(0, topN)
+            .map(({ __abs, ...rest }: any) => ({ ...rest, absDelta: __abs }));
+        return picked;
+    };
+
+    const parseThroughFocusKey = (key: string) => {
+        const [defocusRaw, wlRaw] = String(key || '').split('|').map((s) => s.trim());
+        const defocusMm = Number(defocusRaw);
+        return {
+            defocusMm: Number.isFinite(defocusMm) ? defocusMm : NaN,
+            wavelengthLabel: wlRaw || '',
+        };
+    };
+
+    const aggregateThroughFocusByWavelength = (rows: any[]) => {
+        const map = new Map<string, { absRms: number[]; absDia: number[] }>();
+        for (const row of rows || []) {
+            const parsed = parseThroughFocusKey(String(row?.key || ''));
+            const wl = parsed.wavelengthLabel || 'unknown';
+            if (!map.has(wl)) map.set(wl, { absRms: [], absDia: [] });
+            const slot = map.get(wl)!;
+            const dRms = finiteNumber(row?.deltaRmsUm);
+            const dDia = finiteNumber(row?.deltaDiaUm);
+            if (dRms !== null) slot.absRms.push(Math.abs(dRms));
+            if (dDia !== null) slot.absDia.push(Math.abs(dDia));
+        }
+
+        const mean = (arr: number[]) => arr.length > 0 ? arr.reduce((s, v) => s + v, 0) / arr.length : NaN;
+        return Array.from(map.entries()).map(([wavelengthLabel, slot]) => ({
+            wavelengthLabel,
+            meanAbsDeltaRmsUm: mean(slot.absRms),
+            meanAbsDeltaDiaUm: mean(slot.absDia),
+            sampleCount: Math.max(slot.absRms.length, slot.absDia.length),
+        })).sort((a, b) => {
+            const aa = Number.isFinite(a.meanAbsDeltaRmsUm) ? a.meanAbsDeltaRmsUm : -1;
+            const bb = Number.isFinite(b.meanAbsDeltaRmsUm) ? b.meanAbsDeltaRmsUm : -1;
+            return bb - aa;
+        });
+    };
+
+    const buildCorrectionCandidates = (spotRows: any[], tfRows: any[], summaries: any) => {
+        const candidates: Array<{ area: string; reason: string; action: string }> = [];
+
+        const countMismatch = [...(spotRows || []), ...(tfRows || [])]
+            .filter((r: any) => Number(r?.tsCount || 0) !== Number(r?.rustCount || 0));
+        if (countMismatch.length > 0) {
+            candidates.push({
+                area: 'sampling',
+                reason: `TS/Rust の点数不一致が ${countMismatch.length} ケース`,
+                action: 'Rust 側の rayCount clamp・grid side 算出・annular 点生成順を TS 実装と完全一致させる',
+            });
+        }
+
+        const signedRms = Number(summaries?.throughFocus?.signedMeanDeltaRmsUm);
+        if (Number.isFinite(signedRms) && Math.abs(signedRms) > 0.5) {
+            candidates.push({
+                area: 'spot-scale',
+                reason: `through-focus の平均RMS差が ${signedRms.toFixed(3)} µm`,
+                action: signedRms > 0
+                    ? 'Rust の spot σ 係数（base/defocus gain）を小さくして全体幅を縮小'
+                    : 'Rust の spot σ 係数（base/defocus gain）を大きくして全体幅を拡大',
+            });
+        }
+
+        const spotMax = Number(summaries?.spotDiagram?.maxAbsDeltaRmsUm);
+        const tfMax = Number(summaries?.throughFocus?.maxAbsDeltaRmsUm);
+        if ((Number.isFinite(spotMax) && spotMax > 3.0) || (Number.isFinite(tfMax) && tfMax > 3.0)) {
+            candidates.push({
+                area: 'phase-to-spot model',
+                reason: `最大RMS差が大きい (spot=${Number.isFinite(spotMax) ? spotMax.toFixed(3) : 'n/a'} µm, tf=${Number.isFinite(tfMax) ? tfMax.toFixed(3) : 'n/a'} µm)`,
+                action: 'PSF二次モーメント→spot σ 変換の倍率と anisotropy 項を波長・defocusごとに再フィットする',
+            });
+        }
+
+        return candidates;
+    };
+
+    try {
+        const runtime = await import('../src/desktop/runtime.ts');
+        if (!runtime.isTauriRuntime()) {
+            throw new Error('runSpotParityDiagnostics requires Tauri desktop runtime');
+        }
+    } catch (error: any) {
+        throw new Error(String(error?.message || error || 'runtime check failed'));
+    }
+
+    const { runAnalysisCompute } = await import('../src/desktop/ipc/client.ts');
+    const { generateSurfaceOptions, generateSpotDiagramAsync } = await import('../evaluation/spot-diagram.js');
+
+    const tableOpticalSystem = getTableOpticalSystem();
+    const tableObject = getTableObject();
+    const tableSource = getTableSource();
+
+    const opticalSystemRows = getOpticalSystemRows(tableOpticalSystem);
+    const objectRows = getObjectRows(tableObject);
+    const sourceRows = getSourceRows(tableSource);
+
+    if (!Array.isArray(opticalSystemRows) || opticalSystemRows.length === 0) {
+        throw new Error('No optical system rows available');
+    }
+    if (!Array.isArray(objectRows) || objectRows.length === 0) {
+        throw new Error('No object rows available');
+    }
+
+    const objectIndex = clamp(parseIntOr(options?.objectIndex, 0), 0, objectRows.length - 1);
+    const objectRow = objectRows[objectIndex] || objectRows[0];
+
+    const surfaceOptions = generateSurfaceOptions(opticalSystemRows || []);
+    const surfaceId = Number.isInteger(options?.surfaceIndex)
+        ? Number(options.surfaceIndex)
+        : 0;
+    const matched = Array.isArray(surfaceOptions)
+        ? surfaceOptions.find((o: any) => Number(o?.surfaceId) === Number(surfaceId))
+        : null;
+    const surfaceIndex = Number.isInteger(matched?.rowIndex)
+        ? Number(matched.rowIndex)
+        : Math.max(0, opticalSystemRows.length - 1);
+    const surfaceNumber = surfaceIndex + 1;
+
+    const rayCount = clamp(parseIntOr(options?.rayCount, 501), 9, 20001);
+    const ringCount = clamp(parseIntOr(options?.ringCount, 10), 1, 64);
+    const pattern = String(options?.pattern || getSpotDiagramPattern() || 'annular').toLowerCase() === 'grid'
+        ? 'grid'
+        : 'annular';
+    const wavelengthMode = String(options?.wavelengthMode || 'all').toLowerCase() === 'primary'
+        ? 'primary'
+        : 'all';
+
+    const defocusMinMm = parseFloatOr(options?.defocusMinMm, -0.1);
+    const defocusMaxMm = parseFloatOr(options?.defocusMaxMm, 0.1);
+    const steps = clamp(parseIntOr(options?.steps, 5), 3, 61);
+    const scaleUm = Math.max(1, parseFloatOr(options?.scaleUm, 100));
+
+    const wavelengthRows: any[] = (() => {
+        if (!Array.isArray(sourceRows) || sourceRows.length === 0) return [];
+        return sourceRows
+            .map((row: any) => {
+                const wl = Number(row?.wavelength);
+                if (!Number.isFinite(wl) || wl <= 0) return null;
+                const primaryText = String(row?.primary || '').toLowerCase();
+                const isPrimary = primaryText.includes('primary');
+                return {
+                    ...row,
+                    wavelength: wl,
+                    __isPrimary: isPrimary,
+                    __label: `${(wl * 1000).toFixed(1)} nm${isPrimary ? ' (primary)' : ''}`,
+                };
+            })
+            .filter(Boolean);
+    })();
+    const primaryWavelengthRow = wavelengthRows.find((row: any) => row?.__isPrimary)
+        || (wavelengthRows.length > 0 ? wavelengthRows[0] : null);
+    const effectiveWavelengthRows = wavelengthMode === 'primary'
+        ? (primaryWavelengthRow ? [primaryWavelengthRow] : [{ wavelength: 0.5876, __label: '587.6 nm (primary)' }])
+        : (wavelengthRows.length > 0 ? wavelengthRows : [{ wavelength: 0.5876, __label: '587.6 nm (primary)' }]);
+
+    const traceOptions = await resolveAnalysisRustTraceOptions({
+        forceRustWasm: options?.forceRustWasm === true,
+        requireRustWasm: options?.requireRustWasm !== false,
+    });
+
+    const tsSpotDiagram = new Map<string, any>();
+    for (const wlRow of effectiveWavelengthRows) {
+        const wlLabel = String(wlRow?.__label || `${(Number(wlRow?.wavelength || 0.5876) * 1000).toFixed(1)} nm`);
+        const spotResult = await generateSpotDiagramAsync(
+            opticalSystemRows,
+            [wlRow],
+            [objectRow],
+            surfaceNumber,
+            rayCount,
+            ringCount,
+            {
+                onProgress: null,
+                physicalVignetting: true,
+                displaySurfaceNumber: surfaceId,
+                pattern,
+                traceOptions,
+            }
+        );
+        const pointsRaw = (spotResult?.spotData?.[0]?.spotPoints || []);
+        const pointsUm = normalizePointsUm(pointsRaw);
+        tsSpotDiagram.set(wlLabel, metricFromPointsUm(pointsUm));
+    }
+
+    const rustSpotDiagramRes = await runAnalysisCompute({
+        kind: 'spot-diagram',
+        opticalSystemRows,
+        sourceRows,
+        objectRows: [objectRow],
+        surfaceIndex,
+        rayCount,
+        ringCount,
+        pattern,
+        wavelengthMode,
+    });
+
+    const rustSpotDiagram = new Map<string, any>();
+    const rustSeries = Array.isArray(rustSpotDiagramRes?.spotDiagramSeries) ? rustSpotDiagramRes.spotDiagramSeries : [];
+    for (const series of rustSeries) {
+        const key = String(series?.label || 'series');
+        const pointsUm = Array.isArray(series?.points)
+            ? series.points.map((pt: any) => ({ xUm: Number(pt?.xUm), yUm: Number(pt?.yUm) }))
+                .filter((pt: any) => Number.isFinite(pt.xUm) && Number.isFinite(pt.yUm))
+            : [];
+        rustSpotDiagram.set(key, metricFromPointsUm(pointsUm));
+    }
+
+    const defocusValues = Array.from({ length: steps }, (_, i) => {
+        if (steps <= 1) return defocusMinMm;
+        const t = i / (steps - 1);
+        return defocusMinMm + t * (defocusMaxMm - defocusMinMm);
+    });
+
+    const tsThroughFocus = new Map<string, any>();
+    for (const shift of defocusValues) {
+        const shiftedRows = cloneOpticalSystemRowsWithDefocusShift(opticalSystemRows, shift);
+        for (const wlRow of effectiveWavelengthRows) {
+            const wlLabel = String(wlRow?.__label || `${(Number(wlRow?.wavelength || 0.5876) * 1000).toFixed(1)} nm`);
+            const key = `${shift.toFixed(6)} | ${wlLabel}`;
+            const spotResult = await generateSpotDiagramAsync(
+                shiftedRows,
+                [wlRow],
+                [objectRow],
+                surfaceNumber,
+                rayCount,
+                ringCount,
+                {
+                    onProgress: null,
+                    physicalVignetting: true,
+                    displaySurfaceNumber: surfaceId,
+                    pattern,
+                    traceOptions,
+                }
+            );
+            const pointsRaw = (spotResult?.spotData?.[0]?.spotPoints || []);
+            const pointsUm = normalizePointsUm(pointsRaw);
+            tsThroughFocus.set(key, metricFromPointsUm(pointsUm));
+        }
+    }
+
+    const rustThroughFocusRes = await runAnalysisCompute({
+        kind: 'through-focus-spot',
+        opticalSystemRows,
+        sourceRows,
+        objectRows: [objectRow],
+        surfaceIndex,
+        defocusMinMm,
+        defocusMaxMm,
+        steps,
+        rayCount,
+        ringCount,
+        scaleUm,
+        pattern,
+        wavelengthMode,
+    });
+
+    const rustThroughFocus = new Map<string, any>();
+    const rustTfSeries = Array.isArray(rustThroughFocusRes?.spotSeries) ? rustThroughFocusRes.spotSeries : [];
+    for (const series of rustTfSeries) {
+        const defocus = Number(series?.defocusMm);
+        const wlLabel = String(series?.wavelengthLabel || 'wavelength');
+        const key = `${defocus.toFixed(6)} | ${wlLabel}`;
+        const pointsUm = Array.isArray(series?.points)
+            ? series.points.map((pt: any) => ({ xUm: Number(pt?.xUm), yUm: Number(pt?.yUm) }))
+                .filter((pt: any) => Number.isFinite(pt.xUm) && Number.isFinite(pt.yUm))
+            : [];
+        rustThroughFocus.set(key, metricFromPointsUm(pointsUm));
+    }
+
+    const spotDiagramRows = resultTableFromMaps(tsSpotDiagram, rustSpotDiagram);
+    const throughFocusRows = resultTableFromMaps(tsThroughFocus, rustThroughFocus);
+
+    const topN = clamp(parseIntOr(options?.topN, 12), 3, 100);
+    const summaries = {
+        spotDiagram: computeSummary(spotDiagramRows),
+        throughFocus: computeSummary(throughFocusRows),
+    };
+    const hotspots = {
+        spotDiagramByRms: topHotspots(spotDiagramRows, 'deltaRmsUm', topN),
+        spotDiagramByDia: topHotspots(spotDiagramRows, 'deltaDiaUm', topN),
+        throughFocusByRms: topHotspots(throughFocusRows, 'deltaRmsUm', topN),
+        throughFocusByDia: topHotspots(throughFocusRows, 'deltaDiaUm', topN),
+        throughFocusByWavelength: aggregateThroughFocusByWavelength(throughFocusRows),
+    };
+    const correctionCandidates = buildCorrectionCandidates(spotDiagramRows, throughFocusRows, summaries);
+
+    const report = {
+        config: {
+            objectIndex,
+            surfaceIndex,
+            rayCount,
+            ringCount,
+            pattern,
+            wavelengthMode,
+            defocusMinMm,
+            defocusMaxMm,
+            steps,
+            scaleUm,
+        },
+        summaries,
+        hotspots,
+        correctionCandidates,
+        spotDiagramRows,
+        throughFocusRows,
+        generatedAt: Date.now(),
+    };
+
+    try {
+        (window as any).__cooptLastSpotParity = report;
+        console.groupCollapsed('📊 [SpotParity] TS vs Rust');
+        console.log('config', report.config);
+        console.log('summaries', summaries);
+        console.log('hotspots', hotspots);
+        console.log('correctionCandidates', correctionCandidates);
+        console.log('spotDiagramRows', spotDiagramRows);
+        console.log('throughFocusRows', throughFocusRows);
+        if (console.table) {
+            console.table(hotspots.spotDiagramByRms);
+            console.table(hotspots.throughFocusByRms);
+            console.table(hotspots.throughFocusByWavelength);
+            console.table(spotDiagramRows);
+            console.table(throughFocusRows);
+        }
+        console.groupEnd();
+    } catch (_) {}
+
+    return report;
+}
+
 /**
  * Show transverse aberration diagram
  */
-export async function showTransverseAberrationDiagram(options: any = {}): Promise<void> {
+export async function showTransverseAberrationDiagram(options: any = {}): Promise<any> {
     console.log('📊 Starting transverse aberration calculation...');
 
     const onProgress = (options && typeof options === 'object' && typeof options.onProgress === 'function')
@@ -1830,6 +2511,7 @@ export async function showTransverseAberrationDiagram(options: any = {}): Promis
                 rayCount = inputValue;
             }
         }
+        rayCount = Math.max(9, Math.min(10001, Math.round(rayCount)));
 
         const tableOpticalSystem = getTableOpticalSystem();
         const opticalSystemRows = getOpticalSystemRows(tableOpticalSystem);
@@ -1884,20 +2566,29 @@ export async function showTransverseAberrationDiagram(options: any = {}): Promis
         console.log(`📊 評価面: Surface ${targetSurfaceIndex + 1}`);
         console.log(`📊 光線本数: ${rayCount}本`);
 
-        const { getPrimaryWavelengthForAberration, calculateTransverseAberrationAsync } = await import('../evaluation/aberrations/transverse-aberration.js');
+        const { getPrimaryWavelengthForAberration } = await import('../evaluation/aberrations/transverse-aberration.js');
         const { plotTransverseAberrationDiagram } = await import('../evaluation/aberrations/transverse-aberration-plot.js');
+        const { runNativeTransverseAberration } = await import('../src/desktop/ipc/client.ts');
 
         const wavelength = getPrimaryWavelengthForAberration(); // μm
         console.log(`📊 Wavelength: ${wavelength} μm`);
 
-        const aberrationData = await calculateTransverseAberrationAsync(
+        const tableSource = getTableSource();
+        const tableObject = getTableObject();
+        const sourceRows = getSourceRows(tableSource);
+        const objectRows = getObjectRows(tableObject);
+
+        try { onProgress?.({ percent: 10, message: 'Computing transverse aberration (Rust API)...' }); } catch (_) {}
+        const aberrationData: any = await runNativeTransverseAberration({
             opticalSystemRows,
-            targetSurfaceIndex,
-            null,
-            wavelength,
+            sourceRows: Array.isArray(sourceRows) ? sourceRows : [],
+            objectRows: Array.isArray(objectRows) ? objectRows : [],
+            surfaceIndex: targetSurfaceIndex,
             rayCount,
-            { onProgress } as any
-        );
+            pattern: 'cross',
+            wavelengthMode: 'primary',
+            wavelength,
+        });
 
         if (!aberrationData) {
             throw new Error('Failed to calculate transverse aberration data');
@@ -1907,6 +2598,7 @@ export async function showTransverseAberrationDiagram(options: any = {}): Promis
         plotTransverseAberrationDiagram(aberrationData, containerTarget, typeof containerTarget === 'string' ? document : containerTarget.ownerDocument);
         try { onProgress?.({ percent: 100, message: 'Done' }); } catch (_) {}
         console.log('✅ Transverse aberration diagram generated successfully');
+        return aberrationData;
     } catch (error) {
         console.error('❌ Transverse aberration diagram error:', error);
         const container = typeof containerTarget === 'string'
@@ -1920,6 +2612,7 @@ export async function showTransverseAberrationDiagram(options: any = {}): Promis
             </div>`;
         }
         alert(`Transverse aberration error: ${(error as any).message}`);
+        return null;
     } finally {
         setIsGeneratingTransverseAberration(false);
     }
@@ -1934,6 +2627,9 @@ export async function showMagnificationChromaticAberrationDiagram(options: any =
     const onProgress = (options && typeof options === 'object' && typeof options.onProgress === 'function')
         ? options.onProgress
         : null;
+    const chiefRayDefinition = (options && typeof options === 'object' && typeof options.chiefRayDefinition === 'string')
+        ? options.chiefRayDefinition
+        : 'stop-center';
 
     let containerTarget: any = 'magnification-chromatic-aberration-container';
     if (options && typeof options === 'object') {
@@ -2052,15 +2748,21 @@ export async function showMagnificationChromaticAberrationDiagram(options: any =
             wavelengths.sort((a, b) => a - b);
         }
 
-        const { calculateMagnificationChromaticAberrationData } = await import('../evaluation/aberrations/magnification-chromatic-aberration.js');
+        const { runNativeMagnificationChromaticAberration } = await import('../src/desktop/ipc/client.ts');
         const { plotMagnificationChromaticAberration } = await import('../evaluation/aberrations/magnification-chromatic-aberration-plot.js');
 
-        const data = await calculateMagnificationChromaticAberrationData(
+        const data = await runNativeMagnificationChromaticAberration({
             opticalSystemRows,
-            fieldValues,
+            sourceRows,
+            fieldSamples: fieldValues,
             wavelengths,
-            { referenceWavelength, heightMode, onProgress } as any
-        );
+            referenceWavelength,
+            heightMode,
+            chiefRayDefinition,
+        } as any);
+        try {
+            console.log('📊 [LCA] backend:', (data as any)?.backend || (data as any)?.meta?.backend || 'unknown');
+        } catch (_) {}
 
         if (!data) {
             throw new Error('倍率色収差の計算に失敗しました');
@@ -2068,11 +2770,14 @@ export async function showMagnificationChromaticAberrationDiagram(options: any =
 
         try { onProgress?.({ percent: 95, message: 'Rendering...' }); } catch (_) {}
 
-        plotMagnificationChromaticAberration(
+        const plotted = plotMagnificationChromaticAberration(
             data,
             containerTarget,
             { xMin, xMax }
         );
+        if (!plotted) {
+            throw new Error('倍率色収差: 描画可能な有効データがありません');
+        }
 
         try { onProgress?.({ percent: 100, message: 'Done' }); } catch (_) {}
         console.log('✅ Lateral chromatic aberration diagram generated successfully');
@@ -2129,7 +2834,7 @@ export async function showAstigmatismDiagram(options: any = {}): Promise<void> {
     try {
         setIsGeneratingTransverseAberration(true);
 
-        try { onProgress?.({ percent: 0, message: 'Preparing astigmatism...' }); } catch (_) {}
+        try { onProgress?.({ percent: 0, message: 'Preparing...' }); } catch (_) {}
 
         const normalizeObjectRows = (rows: any) => {
             if (!Array.isArray(rows)) return [];
@@ -2187,27 +2892,106 @@ export async function showAstigmatismDiagram(options: any = {}): Promise<void> {
             const snapshot = loadConfigSnapshot();
             if (snapshot?.opticalSystemRows?.length) {
                 opticalSystemRows = snapshot.opticalSystemRows;
-                sourceRows = snapshot.sourceRows;
-                objectRows = snapshot.objectRows;
+                if (Array.isArray(snapshot.sourceRows) && snapshot.sourceRows.length > 0) {
+                    sourceRows = snapshot.sourceRows;
+                }
+                if (Array.isArray(snapshot.objectRows) && snapshot.objectRows.length > 0) {
+                    objectRows = snapshot.objectRows;
+                }
             }
         }
+
+        if (!Array.isArray(objectRows) || objectRows.length === 0) {
+            try {
+                const directRows = (window as any).tableObject && Array.isArray((window as any).tableObject.data)
+                    ? (window as any).tableObject.data
+                    : null;
+                if (Array.isArray(directRows) && directRows.length > 0) {
+                    objectRows = directRows;
+                }
+            } catch (_) {}
+        }
+
+        if ((!Array.isArray(objectRows) || objectRows.length === 0) && typeof localStorage !== 'undefined') {
+            try {
+                const raw = localStorage.getItem('objectTableData');
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (Array.isArray(parsed) && parsed.length > 0) {
+                        objectRows = parsed;
+                    }
+                }
+            } catch (_) {}
+        }
+
+        if (!Array.isArray(sourceRows) || sourceRows.length === 0) {
+            try {
+                const loadedSourceRows = loadSourceTableData();
+                if (Array.isArray(loadedSourceRows) && loadedSourceRows.length > 0) {
+                    sourceRows = loadedSourceRows;
+                }
+            } catch (_) {}
+        }
+
+        if (!Array.isArray(objectRows) || objectRows.length === 0) {
+            const conjugateType = detectConjugateType(opticalSystemRows);
+            const isInfinite = String(conjugateType).toLowerCase() !== 'finite';
+            objectRows = [
+                isInfinite
+                    ? {
+                        name: 'AutoField0',
+                        position: 'Angle',
+                        xHeightAngle: 0,
+                        yHeightAngle: 0,
+                        x: 0,
+                        y: 0,
+                    }
+                    : {
+                        name: 'AutoField0',
+                        position: 'Rectangle',
+                        xHeight: 0,
+                        yHeight: 0,
+                        x: 0,
+                        y: 0,
+                    }
+            ];
+            console.warn(`[ASTIG_DEBUG][FALLBACK_OBJECT] Injected default object row for conjugate=${conjugateType}`);
+        }
+
+        console.log(
+            `[ASTIG_DEBUG][INPUT_ROWS] optical=${Array.isArray(opticalSystemRows) ? opticalSystemRows.length : 0} ` +
+            `source=${Array.isArray(sourceRows) ? sourceRows.length : 0} ` +
+            `object=${Array.isArray(objectRows) ? objectRows.length : 0} ` +
+            `snapshot=${useActiveConfigSnapshot || (configId !== null && configId !== undefined)}`
+        );
+        try {
+            onProgress?.({
+                percent: 12,
+                message:
+                    `Input optical=${Array.isArray(opticalSystemRows) ? opticalSystemRows.length : 0} ` +
+                    `source=${Array.isArray(sourceRows) ? sourceRows.length : 0} ` +
+                    `object=${Array.isArray(objectRows) ? objectRows.length : 0}`
+            });
+        } catch (_) {}
 
         if (!opticalSystemRows || opticalSystemRows.length === 0) {
             throw new Error('光学系データが見つかりません');
         }
 
-        // Get ray count from (optional) input field or provided options
-        const rayCountInput = document.getElementById('astigmatism-ray-count-input') as HTMLInputElement | null;
-        let rayCount = 51; // Default
-        const providedRayCount = Number.isInteger(options?.rayCount) ? options.rayCount : null;
-        if (providedRayCount !== null && providedRayCount > 0) {
-            rayCount = providedRayCount;
-        } else if (rayCountInput) {
-            const inputValue = parseInt(rayCountInput.value);
-            if (!isNaN(inputValue) && inputValue > 0) {
-                rayCount = inputValue;
-            }
-        }
+        const rayCountFromOption = Number(options?.rayCount);
+        const rayCount = Number.isFinite(rayCountFromOption)
+            ? Math.max(9, Math.min(2001, Math.round(rayCountFromOption)))
+            : 30;
+        const ringCountFromOption = Number(options?.ringCount);
+        const ringCount = Number.isFinite(ringCountFromOption)
+            ? Math.max(1, Math.min(64, Math.round(ringCountFromOption)))
+            : 32;
+        const patternFromOption = String(options?.pattern || '').trim().toLowerCase();
+        const pattern: 'grid' | 'cross' | 'annular' = (
+            patternFromOption === 'grid' || patternFromOption === 'cross' || patternFromOption === 'annular'
+        )
+            ? (patternFromOption as 'grid' | 'cross' | 'annular')
+            : 'annular';
 
         // Get ray filter setting (optional)
         const rayFilterSelect = document.getElementById('astigmatism-ray-filter') as HTMLSelectElement | null;
@@ -2215,41 +2999,30 @@ export async function showAstigmatismDiagram(options: any = {}): Promise<void> {
 
         // Get field mode setting (optional)
         const fieldModeSelect = document.getElementById('astigmatism-field-mode') as HTMLSelectElement | null;
-        const fieldMode = fieldModeSelect ? fieldModeSelect.value : 'object';
+        const fieldMode = fieldModeSelect ? fieldModeSelect.value : 'interpolate';
         
         // Get chief ray mode setting (optional)
         const chiefRayModeSelect = document.getElementById('astigmatism-chief-ray-mode') as HTMLSelectElement | null;
         const chiefRayDefinitionMap: Record<string, ChiefRayMode> = {
             'stop-center': 'stopCenter',
             'beam-midpoint': 'beamCenter',
-            'beam-centroid': 'centroid',
-            'stop-center-image': 'stopCenterImage',
-            'beam-midpoint-image': 'beamCenterImage',
-            'beam-centroid-image': 'centroidImage'
+            'beam-centroid': 'centroid'
         };
         const chiefRayModeFromPopup = chiefRayDefinitionMap[chiefRayDefinition] || null;
         const chiefRayModeValue = chiefRayModeFromPopup
             ? chiefRayModeFromPopup
             : (chiefRayModeSelect ? chiefRayModeSelect.value : 'stopCenter');
-        type ChiefRayMode = 'stopCenter' | 'beamCenter' | 'centroid' | 'stopCenterImage' | 'beamCenterImage' | 'centroidImage';
+        type ChiefRayMode = 'stopCenter' | 'beamCenter' | 'centroid';
         const chiefRayModeCandidates: ChiefRayMode[] = [
             'stopCenter',
             'beamCenter',
-            'centroid',
-            'stopCenterImage',
-            'beamCenterImage',
-            'centroidImage'
+            'centroid'
         ];
         const chiefRayMode: ChiefRayMode = chiefRayModeCandidates.includes(chiefRayModeValue as ChiefRayMode)
             ? (chiefRayModeValue as ChiefRayMode)
             : 'stopCenter';
 
-        console.log(`📊 光線本数: ${rayCount}本`);
-        console.log(`📊 光線フィルタ: ${rayFilter}`);
-        console.log(`📊 画角モード: ${fieldMode}`);
-        console.log(`📊 主光線モード: ${chiefRayMode}`);
-
-        // 補間モードの場合、0°から最大値まで20等分した画角を生成
+        // 補間モードの場合、0°から最大値まで100等分した画角を生成
         // ただし Rectangle/height 指定が1件でもあれば高さモードとみなし、補間は行わずそのまま使う
         let processedObjectRows = objectRows;
         const hasHeightRect = (objectRows || []).some((obj: any) => {
@@ -2261,53 +3034,98 @@ export async function showAstigmatismDiagram(options: any = {}): Promise<void> {
             // Y方向の最大角度を取得
             const maxYAngle = Math.max(...objectRows.map((obj: any) => Math.abs(parseFloat(obj.yHeightAngle || 0))));
 
-            console.log(`📊 最大Y角度: ${maxYAngle}°`);
-
-            // 0°から最大値まで20等分（21点: 0%, 5%, 10%, ..., 100%）
+            // 0°から最大値まで100等分（101点）
+            const subdivisions = 50;
+            const interpolationProgressStart = 16;
+            const interpolationProgressEnd = 60;
             processedObjectRows = [];
-            for (let i = 0; i <= 20; i++) {
-                const angle = (maxYAngle * i) / 20;
+            try {
+                onProgress?.({
+                    percent: interpolationProgressStart,
+                    message: `Interpolating fields 0/${subdivisions} (angle=0.00° / max=${maxYAngle.toFixed(2)}°)`
+                });
+            } catch (_) {}
+            for (let i = 0; i <= subdivisions; i++) {
+                const angle = (maxYAngle * i) / subdivisions;
                 processedObjectRows.push({
                     name: `Field${i}`,
                     xHeightAngle: 0,
                     yHeightAngle: angle,
                     position: 'angle'
                 });
+                const interpolationRatio = subdivisions > 0 ? (i / subdivisions) : 1;
+                const interpolationPercent = interpolationProgressStart + (interpolationProgressEnd - interpolationProgressStart) * interpolationRatio;
+                try {
+                    onProgress?.({
+                        percent: interpolationPercent,
+                        message: `Interpolating fields ${i}/${subdivisions} (angle=${angle.toFixed(2)}° / max=${maxYAngle.toFixed(2)}°)`
+                    });
+                } catch (_) {}
             }
 
-            console.log(`📊 補間画角生成: ${processedObjectRows.length}点 (0° ~ ${maxYAngle}°)`);
-        } else if (fieldMode === 'interpolate' && hasHeightRect) {
-            console.log('ℹ️ Rectangle/heightフィールドのため補間をスキップし、元のObjectを使用');
         }
 
         // Use last surface (image surface) as evaluation surface
         const targetSurfaceIndex = opticalSystemRows.length - 1;
-        console.log(`📊 評価面: Surface ${targetSurfaceIndex + 1}`);
 
-        const { calculateAstigmatismData } = await import('../evaluation/aberrations/astigmatism.js');
+        const { runNativeAstigmatism } = await import('../src/desktop/ipc/client.ts');
         const { plotAstigmaticFieldCurves } = await import('../evaluation/aberrations/astigmatism-plot.js');
-
-        console.log('🎯 非点収差曲線データ生成中（RMS最小値探索）...');
-        const fieldCurvesData = await calculateAstigmatismData(
+        const fieldCurvesData: any = await runNativeAstigmatism({
             opticalSystemRows,
-            sourceRows || [],
-            processedObjectRows || [],
-            targetSurfaceIndex,
-            {
-                spotDiagramMode: false,
-                rayCount: rayCount,
-                interpolationPoints: 20,
-                chiefRayMode: chiefRayMode,
-                onProgress
-            }
-        );
+            sourceRows: sourceRows || [],
+            objectRows: processedObjectRows || [],
+            surfaceIndex: targetSurfaceIndex,
+            rayCount,
+            ringCount,
+            pattern,
+            chiefRayMode,
+            wavelengthMode: 'all',
+        });
+        const astigBackend = String((fieldCurvesData as any)?.backend || 'tauri-native').trim();
+        console.log(`[ASTIG_BACKEND] ${astigBackend}`);
+        try {
+            onProgress?.({ percent: 92, message: `Backend: ${astigBackend}` });
+        } catch (_) {}
+
+        const astigRows = Array.isArray((fieldCurvesData as any)?.data) ? (fieldCurvesData as any).data : [];
+        const validMeridionalCount = astigRows.filter((row: any) => row?.meridionalDeviation !== null && row?.meridionalDeviation !== undefined && Number.isFinite(Number(row?.meridionalDeviation))).length;
+        const validSagittalCount = astigRows.filter((row: any) => row?.sagittalDeviation !== null && row?.sagittalDeviation !== undefined && Number.isFinite(Number(row?.sagittalDeviation))).length;
+        const wavelengthCount = new Set(astigRows.map((row: any) => Number(row?.wavelength)).filter((wl: number) => Number.isFinite(wl))).size;
+        try {
+            onProgress?.({
+                percent: 94,
+                message:
+                    `Summary rows=${astigRows.length} validM=${validMeridionalCount} ` +
+                    `validS=${validSagittalCount} wl=${wavelengthCount}`
+            });
+        } catch (_) {}
 
         if (!fieldCurvesData || !(fieldCurvesData as any).data || (fieldCurvesData as any).data.length === 0) {
             console.warn('⚠️ 非点収差曲線データの生成に失敗しました');
+            try {
+                onProgress?.({
+                    percent: 100,
+                    message: `No plot data (rows=${astigRows.length}, validM=${validMeridionalCount}, validS=${validSagittalCount})`
+                });
+            } catch (_) {}
+            const targetContainer = (typeof containerTarget === 'string')
+                ? document.getElementById(containerTarget)
+                : containerTarget;
+            if (targetContainer) {
+                targetContainer.innerHTML =
+                    '<div style="padding:16px;color:#b00020;font-family:Arial;">' +
+                    '<div style="font-weight:600;margin-bottom:6px;">No astigmatism plot data</div>' +
+                    `<div style="font-size:12px;color:#444;">rows=${astigRows.length}, validM=${validMeridionalCount}, validS=${validSagittalCount}</div>` +
+                    '</div>';
+            }
         } else {
             try { onProgress?.({ percent: 95, message: 'Rendering...' }); } catch (_) {}
-            plotAstigmaticFieldCurves(containerTarget, fieldCurvesData);
-            try { onProgress?.({ percent: 100, message: 'Done' }); } catch (_) {}
+            try {
+                plotAstigmaticFieldCurves(containerTarget, fieldCurvesData);
+                try { onProgress?.({ percent: 100, message: '' }); } catch (_) {}
+            } catch (plotError) {
+                throw plotError;
+            }
         }
 
         console.log('✅ Astigmatism diagram generated successfully');
@@ -2350,6 +3168,17 @@ export async function showLongitudinalAberrationDiagram(options: any = {}): Prom
         setIsGeneratingTransverseAberration(true);
 
         try { onProgress?.({ percent: 0, message: 'Preparing spherical aberration...' }); } catch (_) {}
+
+        const precomputedAberrationData = options && typeof options === 'object'
+            ? options.precomputedAberrationData
+            : null;
+        if (precomputedAberrationData && typeof precomputedAberrationData === 'object') {
+            const { plotLongitudinalAberrationDiagram } = await import('../evaluation/aberrations/longitudinal-aberration-plot.js');
+            try { onProgress?.({ percent: 95, message: 'Rendering...' }); } catch (_) {}
+            await plotLongitudinalAberrationDiagram(precomputedAberrationData, containerTarget);
+            try { onProgress?.({ percent: 100, message: 'Done' }); } catch (_) {}
+            return;
+        }
         
         // Get selected parameters with fallback defaults
         const rayCountInput = document.getElementById('longitudinal-ray-count-input') as HTMLInputElement | null;
@@ -2818,7 +3647,7 @@ export async function showIntegratedAberrationDiagram(options: any = {}): Promis
         // デフォルト設定
         // Integrated Aberration Diagram の球面収差は 100 本
         const rayCountSpherical = 100;
-        const rayCountAstigmatism = 31;  // 非点収差用の光線数（計算時間を考慮）
+        const rayCountAstigmatism = 30;
 
         // Wavelengths:
         // - Prefer Source table wavelengths (μm). If the user entered nm (e.g. 587.6), normalize to μm.
@@ -2868,15 +3697,21 @@ export async function showIntegratedAberrationDiagram(options: any = {}): Promis
         
         // 2. 非点収差データを計算
         console.log('📊 Calculating astigmatism...');
-        const { calculateAstigmatismData } = await import('../evaluation/aberrations/astigmatism.js');
-        
-        const astigmatismData = await calculateAstigmatismData(
+        let astigmatismData: any = null;
+        const { runNativeAstigmatism } = await import('../src/desktop/ipc/client.ts');
+        const astigRingCount = 32;
+        const astigPattern: 'annular' = 'annular';
+        astigmatismData = await runNativeAstigmatism({
             opticalSystemRows,
-            sourceRows,
-            objectRows,
+            sourceRows: sourceRows || [],
+            objectRows: objectRows || [],
             surfaceIndex,
-            { spotDiagramMode: false, rayCount: rayCountAstigmatism, interpolationPoints: 20 }
-        );
+            rayCount: rayCountAstigmatism,
+            ringCount: astigRingCount,
+            pattern: astigPattern,
+            chiefRayMode: 'stopCenter',
+            wavelengthMode: 'all',
+        });
         
         if (!astigmatismData) {
             throw new Error('Failed to calculate astigmatism');
@@ -2884,7 +3719,7 @@ export async function showIntegratedAberrationDiagram(options: any = {}): Promis
         
         // 3. 歪曲収差データを計算
         console.log('📊 Calculating distortion...');
-        const { calculateDistortionData } = await import('../evaluation/aberrations/distortion.js');
+        const { runNativeDistortion, runNativeMagnificationChromaticAberration } = await import('../src/desktop/ipc/client.ts');
         const { deriveMaxFieldAngleFromObjects } = await import('../evaluation/aberrations/distortion-plot.js');
         
         // Decide field sweep (object angles vs object heights) based on Object table setting
@@ -2946,12 +3781,12 @@ export async function showIntegratedAberrationDiagram(options: any = {}): Promis
             const wavelength = wavelengths[wlIndex];
             const wlBase = 70 + (25 * wlIndex) / Math.max(1, wavelengths.length);
             const wlSpan = 25 / Math.max(1, wavelengths.length);
-            const distData = await calculateDistortionData(
+            const distData = await runNativeDistortion({
                 opticalSystemRows,
-                fieldValues,
+                fieldSamples: fieldValues,
+                heightMode,
                 wavelength,
-                { heightMode, onProgress: mapProgress(wlBase, wlSpan, `Distortion (λ=${wavelength.toFixed(4)}μm)`) }
-            );
+            } as any);
             if (distData) {
                 distortionDataByWavelength.push({
                     wavelength: wavelength,
@@ -2966,8 +3801,6 @@ export async function showIntegratedAberrationDiagram(options: any = {}): Promis
 
         // 4. Lateral Chromatic Aberration (LCA) データを計算
         console.log('📊 Calculating lateral chromatic aberration...');
-        const { calculateMagnificationChromaticAberrationData } = await import('../evaluation/aberrations/magnification-chromatic-aberration.js');
-
         const lcaMaxField = heightMode
             ? Math.max(...heightCandidates)
             : Math.max(...fieldValues.map(v => Math.abs(v)));
@@ -2981,12 +3814,14 @@ export async function showIntegratedAberrationDiagram(options: any = {}): Promis
         }
 
         const lcaData = lcaFieldValues.length > 0
-            ? await calculateMagnificationChromaticAberrationData(
+            ? await runNativeMagnificationChromaticAberration({
                 opticalSystemRows,
-                lcaFieldValues,
+                sourceRows,
+                fieldSamples: lcaFieldValues,
                 wavelengths,
-                { referenceWavelength: 0.5876, heightMode, onProgress: mapProgress(70, 15, 'LCA') } as any
-            )
+                referenceWavelength: 0.5876,
+                heightMode,
+            } as any)
             : null;
         
         // 5. 統合収差図を表示

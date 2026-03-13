@@ -18,7 +18,7 @@ import {
     deriveBlocksFromLegacyOpticalSystemRows,
     validateBlocksConfiguration,
     BLOCK_SCHEMA_VERSION
-} from '../compat/block-schema.ts';
+} from '../data/block-schema.ts';
 import { SetBlockParameterCommand } from '../core/undo-history.ts';
 import { requestRefreshBlockInspector, requestUpdateSurfaceNumberSelect } from '../core/window-facade.ts';
 import { 
@@ -58,6 +58,7 @@ import {
     loadTableData as loadSystemRequirementsTableData,
     saveTableData as saveSystemRequirementsTableData
 } from '../data/table-system-requirements.ts';
+import { isTauriRuntime } from '../src/desktop/runtime.ts';
 
 // Type definitions
 type BlockType = string;
@@ -1762,14 +1763,43 @@ async function __loadAllDataObjectIntoApp(allData: any, options: { filename?: st
                 }
             } catch (_) {}
             try {
-                const reqData = loadSystemRequirementsTableData();
-                const reqEditor = w.systemRequirementsEditor;
-                if (reqEditor && typeof reqEditor.setData === 'function') {
-                    reqEditor.setData(reqData);
+                const runRequirementSyncSequence = async () => {
+                    const reqEditor = w.systemRequirementsEditor;
+                    if (!reqEditor) return;
+
+                    const reqData = loadSystemRequirementsTableData();
+                    if (typeof reqEditor.setData === 'function') {
+                        reqEditor.setData(reqData);
+                    }
+
+                    const evaluateNow = async (reason: string) => {
+                        try {
+                            if (typeof reqEditor.evaluateAndUpdateNow === 'function') {
+                                const p = reqEditor.evaluateAndUpdateNow({ reason, forceSilent: true, silent: true });
+                                if (p && typeof p.then === 'function') {
+                                    await p;
+                                }
+                            }
+                        } catch (_) {}
+                    };
+
+                    await evaluateNow('load-file-seq-initial');
+
                     if (typeof reqEditor.scheduleEvaluateAndUpdate === 'function') {
                         reqEditor.scheduleEvaluateAndUpdate();
                     }
-                }
+
+                    for (let i = 0; i < 4; i++) {
+                        await new Promise((resolve) => setTimeout(resolve, 120));
+                        await evaluateNow(`load-file-seq-retry-${i + 1}`);
+                    }
+
+                    try {
+                        window.dispatchEvent(new CustomEvent('coopt:requirements-updated'));
+                    } catch (_) {}
+                };
+
+                void runRequirementSyncSequence();
             } catch (_) {}
             try { refreshBlockInspector(); } catch (_) {}
             try {
@@ -1802,9 +1832,15 @@ if (typeof window !== 'undefined') {
     } catch (_) {}
 }
 
+function isReactManagedButton(el: HTMLElement | null): boolean {
+    if (!el) return false;
+    return el.getAttribute('data-react-handled') === '1';
+}
+
 function setupLoadAllButton(): void {
     const btn = document.getElementById('load-all-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     const loadHandler = () => {
         const input = document.createElement('input');
@@ -2093,6 +2129,7 @@ function __normalizeZmxFilenameDefault(name: string | null | undefined): string 
 function setupImportZemaxButton(): void {
     const btn = document.getElementById('import-zemax-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     const importHandler = () => {
         const input = document.createElement('input');
@@ -2225,6 +2262,7 @@ function setupImportZemaxButton(): void {
 function setupExportZemaxButton(): void {
     const btn = document.getElementById('export-zemax-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     const exportHandler = async () => {
         try {
@@ -2292,6 +2330,7 @@ function setupExportZemaxButton(): void {
 function setupOptimizeDesignIntentButton(): void {
     const optimizeBtn = document.getElementById('optimize-design-intent-btn') as HTMLButtonElement | null;
     if (!optimizeBtn) return;
+    if (isReactManagedButton(optimizeBtn)) return;
 
     optimizeBtn.addEventListener('click', async () => {
         const _gThis = (typeof globalThis !== 'undefined') ? globalThis as any : {} as any;
@@ -2310,6 +2349,101 @@ function setupOptimizeDesignIntentButton(): void {
         const prevDisabled = optimizeBtn.disabled;
         optimizeBtn.disabled = true;
         try {
+            if (isTauriRuntime()) {
+                const opticalSystemRows = (w.getOpticalSystemRows && w.tableOpticalSystem)
+                    ? w.getOpticalSystemRows(w.tableOpticalSystem)
+                    : ((w.tableOpticalSystem && typeof w.tableOpticalSystem.getData === 'function') ? w.tableOpticalSystem.getData() : []);
+
+                if (!Array.isArray(opticalSystemRows) || opticalSystemRows.length === 0) {
+                    alert('最適化対象の光学系データがありません。');
+                    return;
+                }
+
+                const systemRequirementsRows = (() => {
+                    try {
+                        const sre = (window as any).systemRequirementsEditor;
+                        if (sre && typeof sre.getData === 'function') {
+                            const rows = sre.getData();
+                            if (Array.isArray(rows)) return rows;
+                        }
+                    } catch (_) {}
+                    return [];
+                })();
+
+                const sourceRows = (w.tableSource && typeof w.tableSource.getData === 'function')
+                    ? w.tableSource.getData()
+                    : [];
+                const objectRows = (w.tableObject && typeof w.tableObject.getData === 'function')
+                    ? w.tableObject.getData()
+                    : [];
+                const activeConfigId = (() => {
+                    try {
+                        const cfg = (typeof w.loadSystemConfigurationsFromTableConfig === 'function')
+                            ? w.loadSystemConfigurationsFromTableConfig()
+                            : (typeof w.loadSystemConfigurations === 'function' ? w.loadSystemConfigurations() : null);
+                        if (cfg && cfg.activeConfigId !== undefined && cfg.activeConfigId !== null) {
+                            return String(cfg.activeConfigId).trim();
+                        }
+                    } catch (_) {}
+                    return '';
+                })();
+
+                const opt = w.OptimizationMVP;
+                if (!opt || typeof opt.run !== 'function') {
+                    alert('OptimizationMVP が利用できません。');
+                    return;
+                }
+
+                const progressEvents: any[] = [];
+                const result = await opt.run({
+                    opticalSystemRows,
+                    sourceRows,
+                    objectRows,
+                    activeConfigId,
+                    systemRequirementsRows,
+                    maxIterations: 24,
+                    method: 'kkt',
+                    forceTs: true,
+                    onProgress: (ev: any) => {
+                        if (!ev || typeof ev !== 'object') return;
+                        progressEvents.push(ev);
+                    },
+                });
+
+                if (Array.isArray(progressEvents) && progressEvents.length > 0) {
+                    console.log('📈 [Optimize][TS][Progress]', progressEvents.slice(-8));
+                }
+
+                try {
+                    if (typeof (window as any).drawOpticalSystem === 'function') {
+                        (window as any).drawOpticalSystem();
+                    }
+                } catch (applyErr) {
+                    console.warn('⚠️ [Optimize][TS] result apply failed:', applyErr);
+                }
+
+                const modeUsed = String(result?.method || 'kkt');
+                const iterations = Number(result?.iterations ?? 0);
+                const variableCount = Number(result?.variables ?? 0);
+                const meritBefore = Number(result?.before ?? Number.NaN);
+                const meritAfter = Number(result?.best ?? Number.NaN);
+                const requirementScoreAfter = Number(result?.violationScore ?? Number.NaN);
+                const converged = !result?.aborted;
+
+                alert(
+                    [
+                        'TS optimizer step completed',
+                        `mode: ${modeUsed}`,
+                        `iterations: ${iterations}`,
+                        `variables: ${variableCount}`,
+                        `merit: ${Number.isFinite(meritBefore) ? meritBefore.toFixed(6) : 'NaN'} -> ${Number.isFinite(meritAfter) ? meritAfter.toFixed(6) : 'NaN'}`,
+                        `requirements: ${Number.isFinite(requirementScoreAfter) ? requirementScoreAfter.toFixed(6) : 'NaN'}`,
+                        converged ? 'status: converged' : 'status: in-progress',
+                    ].join('\n')
+                );
+                return;
+            }
+
             const opt = w.OptimizationMVP;
             if (!opt || typeof opt.run !== 'function') {
                 alert('OptimizationMVP が利用できません。');
@@ -2412,11 +2546,11 @@ function setupOptimizeDesignIntentButton(): void {
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Vars</span><span id="opt-vars" style="margin-left:8px;">-</span></div>
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Req</span><span id="opt-req" style="margin-left:8px;">-</span></div>
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Res</span><span id="opt-res" style="margin-left:8px;">-</span></div>
-    <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Score</span><span id="opt-cur" style="margin-left:8px;">-</span></div>
+    <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">ReqScore(active)</span><span id="opt-cur" style="margin-left:8px;">-</span></div>
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Violation</span><span id="opt-vio" style="margin-left:8px;">-</span></div>
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Soft</span><span id="opt-soft" style="margin-left:8px;">-</span></div>
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Best</span><span id="opt-best" style="margin-left:8px;">-</span></div>
-    <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Rho</span><span id="opt-rho" style="margin-left:8px;">-</span></div>
+    <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Penalty ρ</span><span id="opt-rho" style="margin-left:8px;">-</span></div>
     <div style="display:flex; align-items:baseline;"><span style="display:inline-block; width:110px; color:#555;">Issue</span><span id="opt-issue" style="margin-left:8px;">-</span></div>
 </div>
 <details style="margin-top:10px; margin-bottom:10px; font-size:12px; color:#555;">
@@ -2688,14 +2822,52 @@ function setupOptimizeDesignIntentButton(): void {
                         return [];
                     })();
 
-                    reqCount = Array.isArray(rows) ? rows.length : NaN;
-                    if (Array.isArray(rows) && rows.length > 0) {
+                    const activeConfigId = (() => {
+                        try {
+                            const cfg = (typeof w.loadSystemConfigurationsFromTableConfig === 'function')
+                                ? w.loadSystemConfigurationsFromTableConfig()
+                                : (typeof w.loadSystemConfigurations === 'function' ? w.loadSystemConfigurations() : null);
+                            if (cfg && cfg.activeConfigId !== undefined && cfg.activeConfigId !== null) {
+                                return String(cfg.activeConfigId).trim();
+                            }
+                        } catch (_) {}
+                        return '';
+                    })();
+
+                    const normalizeConfigId = (row: any): string => {
+                        try {
+                            if (sre && typeof sre._normalizeConfigId === 'function') {
+                                return String(sre._normalizeConfigId(row?.configId, cfg, activeConfigId) || '').trim();
+                            }
+                        } catch (_) {}
+                        const rawCfg = String(row?.configId ?? '').trim();
+                        return rawCfg || activeConfigId;
+                    };
+
+                    const isActiveRequirement = (row: any): boolean => {
+                        if (!row || typeof row !== 'object') return false;
+                        const enabled = (row.enabled === undefined || row.enabled === null) ? true : !!row.enabled;
+                        const operand = String(row.operand ?? '').trim();
+                        const weight = Number(row.weight ?? 1);
+                        if (!enabled || !operand || !(Number.isFinite(weight) && weight > 0)) return false;
+                        const reqCfg = normalizeConfigId(row);
+                        if (!activeConfigId) return true;
+                        return reqCfg === activeConfigId;
+                    };
+
+                    const activeRows = Array.isArray(rows) ? rows.filter((r: any) => isActiveRequirement(r)) : [];
+                    reqCount = activeRows.length;
+                    if (activeRows.length > 0) {
                         let s = 0;
-                        for (const row of rows) {
+                        let finiteCount = 0;
+                        for (const row of activeRows) {
                             const c = Number(row?._contribution);
-                            if (Number.isFinite(c) && c > 0) s += c;
+                            if (Number.isFinite(c)) {
+                                if (c > 0) s += c;
+                                finiteCount += 1;
+                            }
                         }
-                        if (Number.isFinite(s)) score = s;
+                        if (finiteCount > 0 && Number.isFinite(s)) score = s;
                     }
                 } catch (_) {}
 
@@ -2729,12 +2901,45 @@ function setupOptimizeDesignIntentButton(): void {
                     const hasOpenRenderPopup = !!(renderPopup && !renderPopup.closed);
 
                     if (!hasOpenRenderPopup) {
+                        const openRender = (w as any).__cooptOpenRenderWindow || (window as any).__cooptOpenRenderWindow;
+                        if (isTauriRuntime() && typeof openRender === 'function') {
+                            void Promise.resolve(openRender());
+                        }
                         if (typeof w.handleRender3D === 'function') {
                             w.handleRender3D();
-                        } else if (typeof w.__open3DWindowLegacy === 'function') {
-                            w.__open3DWindowLegacy();
+                        } else {
+                            try {
+                                const openBtn = document.getElementById('open-3d-window-btn') as HTMLButtonElement | null;
+                                if (openBtn && typeof openBtn.click === 'function') {
+                                    openBtn.click();
+                                } else if (typeof w.__open3DWindowLegacy === 'function') {
+                                    w.__open3DWindowLegacy();
+                                }
+                            } catch (_) {}
                         }
                     }
+
+                    // Tauri render window is a separate WebviewWindow, so use storage-based redraw sync.
+                    try {
+                        const g = (typeof globalThis !== 'undefined') ? (globalThis as any) : null;
+                        const overrideRows = g && Array.isArray(g.__cooptOpticalSystemRowsOverride) && g.__cooptOpticalSystemRowsOverride.length > 0
+                            ? g.__cooptOpticalSystemRowsOverride
+                            : null;
+                        const rows = overrideRows
+                            ?? (typeof w.getOpticalSystemRows === 'function' ? w.getOpticalSystemRows(w.tableOpticalSystem) : []);
+                        const payload = { ts: Date.now(), rows: Array.isArray(rows) ? rows : [] };
+                        localStorage.setItem('coopt.renderSyncRequest', JSON.stringify(payload));
+                        if (isTauriRuntime()) {
+                            void (async () => {
+                                try {
+                                    const mod = await import('@tauri-apps/api/event');
+                                    if (mod && typeof (mod as any).emit === 'function') {
+                                        await (mod as any).emit('coopt-render-sync-request', payload);
+                                    }
+                                } catch (_) {}
+                            })();
+                        }
+                    } catch (_) {}
 
                     const drawNow = () => {
                         try {
@@ -3768,6 +3973,7 @@ function setupSuggestOptimizeButtons(): void {
 function setupNewFileButton(): void {
     const btn = document.getElementById('new-file-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     // Remove existing listener to prevent duplicates
     const newHandler = () => {
@@ -3857,6 +4063,7 @@ function setupNewFileButton(): void {
 function setupSaveButton(): void {
     const btn = document.getElementById('save-all-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     const saveHandler = async () => {
         try {
@@ -3980,6 +4187,7 @@ function buildAllDataForExport(): any {
 function setupLoadDefaultButton(): void {
     const btn = document.getElementById('load-default-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     const defaultHandler = async () => {
         if (!confirm('Load default optical system? Current data will be replaced.')) return;
@@ -4011,6 +4219,7 @@ function setupLoadDefaultButton(): void {
 function setupShareUrlButton(): void {
     const btn = document.getElementById('share-url-btn');
     if (!btn) return;
+    if (isReactManagedButton(btn as HTMLElement)) return;
 
     const WARN_LEN = 2000;
     const MAX_LEN = 30000;
@@ -4077,7 +4286,7 @@ function setupClearStorageButton(): void {
 function setupParaxialButton(): void {
     const btn = document.getElementById('calculate-paraxial-btn');
     if (!btn) return;
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
         try {
             if (typeof w.outputParaxialDataToDebug === 'function') {
                 const tableOpticalSystem = w.tableOpticalSystem;
@@ -4094,7 +4303,7 @@ function setupParaxialButton(): void {
 function setupSeidelButton(): void {
     const btn = document.getElementById('calculate-seidel-btn');
     if (!btn) return;
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
         try {
             if (typeof w.outputSeidelCoefficientsToDebug === 'function') {
                 w.outputSeidelCoefficientsToDebug();

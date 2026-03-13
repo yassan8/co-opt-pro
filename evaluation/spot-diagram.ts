@@ -397,6 +397,13 @@ export function generateSpotDiagram(opticalSystemRows, sourceRows, objectRows, s
         (traceOptions && typeof traceOptions === 'object' && traceOptions.useRustWasm === true)
         || (options && typeof options === 'object' && options.useRustWasm === true)
     );
+    const requireRustSpotOriginSolve = !!(
+        (traceOptions && typeof traceOptions === 'object' && traceOptions.requireRustWasm === true)
+        || (options && typeof options === 'object' && options.requireRustWasm === true)
+    );
+    if (requireRustSpotOriginSolve && !preferRustSpotOriginSolve) {
+        throw new Error('Spot Diagram requires Rust-WASM, but Rust origin-solve backend is not enabled.');
+    }
     const originSolveTraceBackend = (!forceTsSpotOriginSolve && preferRustSpotOriginSolve) ? 'rust' : 'ts';
     const surfaceInfoList = __spot_calculateSurfaceOriginsPreferRust(opticalSystemRows, traceOptions);
 
@@ -548,7 +555,7 @@ export function generateSpotDiagram(opticalSystemRows, sourceRows, objectRows, s
                     traceOptions,
                     24
                 );
-                const shouldFallbackToTsStarts = !!(
+                const shouldFallbackToTsStarts = !requireRustSpotOriginSolve && !!(
                     alignment
                     && Number.isFinite(alignment.meanErrMm)
                     && Number.isFinite(alignment.maxErrMm)
@@ -648,11 +655,11 @@ export function generateSpotDiagram(opticalSystemRows, sourceRows, objectRows, s
                         if (hitPointLocal && typeof hitPointLocal.x === 'number' && typeof hitPointLocal.y === 'number') {
                             const isChief = rayStart.isChief === true || (rayStart.isChief === undefined && i === 0);
                             
-                            // For spot diagram, use global coordinates at the target surface.
-                            // The chief-ray-relative centering is done later in drawSpotDiagram.
+                            // For spot diagram, use local coordinates on the target surface.
+                            // Using global XY distorts the pattern when CoordTrans/tilt/decenter exists.
                             const spotPoint = {
-                                x: hitPointGlobal.x,
-                                y: hitPointGlobal.y,
+                                x: hitPointLocal.x,
+                                y: hitPointLocal.y,
                                 z: hitPointLocal.z,
                                 globalX: hitPointGlobal?.x,
                                 globalY: hitPointGlobal?.y,
@@ -725,7 +732,7 @@ export function generateSpotDiagram(opticalSystemRows, sourceRows, objectRows, s
 
                     for (const allowOriginSolve of allowOriginSolveToggles) {
                         let r = traceOnceWithScale(s, aim, disableAngleOpt, allowOriginSolve);
-                        const shouldAttemptTsRecovery = (
+                        const shouldAttemptTsRecovery = !requireRustSpotOriginSolve && (
                             r?.originSolveTraceBackend === 'rust'
                             && Array.isArray(r?.starts)
                             && r.starts.length > 0
@@ -1561,6 +1568,13 @@ export async function generateSpotDiagramAsync(
         (traceOptions && typeof traceOptions === 'object' && traceOptions.useRustWasm === true)
         || (enhancedOptions && typeof enhancedOptions === 'object' && enhancedOptions.useRustWasm === true)
     );
+    const requireRustSpotOriginSolve = !!(
+        (traceOptions && typeof traceOptions === 'object' && traceOptions.requireRustWasm === true)
+        || (enhancedOptions && typeof enhancedOptions === 'object' && enhancedOptions.requireRustWasm === true)
+    );
+    if (requireRustSpotOriginSolve && !preferRustSpotOriginSolve) {
+        throw new Error('Spot Diagram requires Rust-WASM, but Rust origin-solve backend is not enabled.');
+    }
     const originSolveTraceBackend = (!forceTsSpotOriginSolve && preferRustSpotOriginSolve) ? 'rust' : 'ts';
     const enableSpotFailureDiagnostics = (() => {
         try {
@@ -1799,7 +1813,7 @@ export async function generateSpotDiagramAsync(
                     traceOptions,
                     24
                 );
-                const shouldFallbackToTsStarts = !!(
+                const shouldFallbackToTsStarts = !requireRustSpotOriginSolve && !!(
                     alignment
                     && Number.isFinite(alignment.meanErrMm)
                     && Number.isFinite(alignment.maxErrMm)
@@ -2023,7 +2037,7 @@ export async function generateSpotDiagramAsync(
                             allowStopBasedOriginSolveRequested
                         });
 
-                        const shouldAttemptTsRecovery = (
+                        const shouldAttemptTsRecovery = !requireRustSpotOriginSolve && (
                             r?.originSolveTraceBackend === 'rust'
                             && Array.isArray(r?.starts)
                             && r.starts.length > 0

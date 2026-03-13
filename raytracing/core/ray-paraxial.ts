@@ -1675,10 +1675,14 @@ export function getRefractiveIndex(surface, wavelength = 0.5875618) {
   const effectiveAbbe = surface.__cooptActualAbbe ?? surface.abbe;
   
   // Check if effectiveMaterial is a numeric string (e.g., "1.336")
-  // If so, treat it as a direct refractive index value
+  // If so, treat it as nd and, when Abbe is available, apply wavelength dispersion approximation.
   if (effectiveMaterial && effectiveMaterial !== '') {
     const materialAsNumber = parseFloat(String(effectiveMaterial));
     if (!isNaN(materialAsNumber) && materialAsNumber > 1.0) {
+      const vdFromSurface = parseFloat(effectiveAbbe || surface.Abbe || surface.vd || surface.Vd);
+      if (!isNaN(vdFromSurface) && vdFromSurface > 0) {
+        return estimateRefractiveIndexFromNdVd(materialAsNumber, vdFromSurface, wavelength);
+      }
       return materialAsNumber;
     }
   }
@@ -1870,6 +1874,95 @@ export function calculateParaxialData(opticalSystemRows, wavelength = 0.5875618)
   } catch (error) {
     // console.error('calculateParaxialData でエラーが発生しました:', error);
     // console.error('スタックトレース:', error.stack);
+    return null;
+  }
+}
+
+/**
+ * 像側NAベースの回折パラメータを計算
+ *
+ * 優先式:
+ *   F#_work = (imageDistance - exitPupilPosition) / exitPupilDiameter
+ *   NA_img  = 1 / (2 * F#_work)  (空気中の近軸近似)
+ *   cutoff(lp/mm) = 2 * NA_img / lambda(mm) = 2000 * NA_img / lambda(um)
+ *
+ * フォールバック:
+ *   F#_work が得られない場合は f'/EnPD を使用
+ */
+export function calculateImageSpaceDiffractionParams(opticalSystemRows, wavelength = 0.5875618) {
+  try {
+    const wlUm = Number(wavelength);
+    if (!Number.isFinite(wlUm) || wlUm <= 0) {
+      return null;
+    }
+
+    const paraxial = calculateParaxialData(opticalSystemRows, wlUm);
+
+    const imageDistanceMm = Number(paraxial?.imageDistance);
+    const backFocalLengthMm = Number(paraxial?.backFocalLength);
+    const focalLengthMm = Number(paraxial?.focalLength);
+    const entrancePupilDiameterMm = Number(paraxial?.entrancePupilDiameter);
+    const exitPupilDiameterMm = Number(paraxial?.exitPupilDetails?.diameter ?? paraxial?.exitPupilDiameter);
+    const exitPupilPositionMm = Number(paraxial?.exitPupilDetails?.position);
+
+    let fNumberWorking = NaN;
+
+    if (
+      Number.isFinite(imageDistanceMm) &&
+      Number.isFinite(exitPupilPositionMm) &&
+      Number.isFinite(exitPupilDiameterMm) &&
+      Math.abs(exitPupilDiameterMm) > 1e-12
+    ) {
+      // Project convention: exitPupilDetails.position is measured from system origin.
+      // Working distance in image space is (image plane z - exit pupil z).
+      const lImgMm = imageDistanceMm - exitPupilPositionMm;
+      if (Number.isFinite(lImgMm) && lImgMm > 0) {
+        fNumberWorking = lImgMm / Math.abs(exitPupilDiameterMm);
+      }
+    }
+
+    // Fallback to f'/EnPD when working F# is unavailable.
+    if (!(Number.isFinite(fNumberWorking) && fNumberWorking > 0)) {
+      if (
+        Number.isFinite(focalLengthMm) &&
+        Number.isFinite(entrancePupilDiameterMm) &&
+        Math.abs(entrancePupilDiameterMm) > 1e-12
+      ) {
+        fNumberWorking = Math.abs(focalLengthMm) / Math.abs(entrancePupilDiameterMm);
+      }
+    }
+
+    if (!(Number.isFinite(fNumberWorking) && fNumberWorking > 0)) {
+      return null;
+    }
+
+    const naImage = 1.0 / (2.0 * fNumberWorking);
+    const cutoffLpmm = (2000.0 * naImage) / wlUm;
+
+    if (!(Number.isFinite(naImage) && naImage > 0 && Number.isFinite(cutoffLpmm) && cutoffLpmm > 0)) {
+      return null;
+    }
+
+    const principalPlaneOffsetMm = (
+      Number.isFinite(imageDistanceMm) && Number.isFinite(backFocalLengthMm)
+    )
+      ? (imageDistanceMm - backFocalLengthMm)
+      : NaN;
+
+    return {
+      wavelengthUm: wlUm,
+      fNumberWorking,
+      naImage,
+      cutoffLpmm,
+      focalLengthMm: Number.isFinite(focalLengthMm) ? focalLengthMm : NaN,
+      entrancePupilDiameterMm: Number.isFinite(entrancePupilDiameterMm) ? entrancePupilDiameterMm : NaN,
+      exitPupilDiameterMm: Number.isFinite(exitPupilDiameterMm) ? exitPupilDiameterMm : NaN,
+      exitPupilPositionMm: Number.isFinite(exitPupilPositionMm) ? exitPupilPositionMm : NaN,
+      imageDistanceMm: Number.isFinite(imageDistanceMm) ? imageDistanceMm : NaN,
+      backFocalLengthMm: Number.isFinite(backFocalLengthMm) ? backFocalLengthMm : NaN,
+      principalPlaneOffsetMm,
+    };
+  } catch (_) {
     return null;
   }
 }

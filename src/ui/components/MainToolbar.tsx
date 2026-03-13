@@ -5,12 +5,14 @@ import {
   handleLoad, 
   handleLoadDefault, 
   handleClearStorage,
+  handleShareUrl,
   handleImportZemax,
   handleExportZemax,
   handleOptimize,
   handleRender3D,
   handleSystemData,
-  handleAnalysisSelect
+  handleAnalysisSelect,
+  handleOpenSettings
 } from '../../../ui/toolbar-handlers';
 import { getLoadedFileName, getLoadedFileWarn } from '../../../ui/loaded-file-storage';
 import { getToolbarCollapsed, setToolbarCollapsed } from '../../../ui/toolbar-collapsed-storage';
@@ -80,7 +82,7 @@ export default function MainToolbar() {
         <span id="loaded-file-name" className="top-file-name" style={{ color: loadedFileColor }}>
           {loadedFileText}
         </span>
-        <button id="open-settings-btn" className="top-settings-btn" title="Settings">
+        <button id="open-settings-btn" className="top-settings-btn" title="Settings" onClick={handleOpenSettings} type="button">
           ⚙️
         </button>
         <button
@@ -100,11 +102,11 @@ export default function MainToolbar() {
       >
         <div className="button-group">
           <span className="button-group-label">File</span>
-          <button id="new-file-btn" onClick={handleNewFile}>New File</button>
-          <button id="save-all-btn" onClick={handleSave}>Save File</button>
-          <button id="load-all-btn" onClick={handleLoad}>Load File</button>
-          <button id="load-default-btn" onClick={handleLoadDefault}>Load Default</button>
-          <button id="share-url-btn">Share URL</button>
+          <button id="new-file-btn" onClick={handleNewFile} data-react-handled="1">New File</button>
+          <button id="save-all-btn" onClick={handleSave} data-react-handled="1">Save File</button>
+          <button id="load-all-btn" onClick={handleLoad} data-react-handled="1">Load File</button>
+          <button id="load-default-btn" onClick={handleLoadDefault} data-react-handled="1">Load Default</button>
+          <button id="share-url-btn" onClick={handleShareUrl} data-react-handled="1">Share URL</button>
           <button id="clear-storage-btn" onClick={handleClearStorage}>Clear Cache</button>
         </div>
 
@@ -114,6 +116,7 @@ export default function MainToolbar() {
             id="import-zemax-btn"
             title="Import a Zemax .zmx file (minimal subset)"
             onClick={handleImportZemax}
+            data-react-handled="1"
           >
             Import Zemax
           </button>
@@ -121,6 +124,7 @@ export default function MainToolbar() {
             id="export-zemax-btn"
             title="Export current optical system as Zemax .zmx"
             onClick={handleExportZemax}
+            data-react-handled="1"
           >
             Export Zemax
           </button>
@@ -128,13 +132,15 @@ export default function MainToolbar() {
 
         <div className="button-group">
           <span className="button-group-label">View</span>
-          <button id="open-3d-window-btn" title="Render 3D view in popup window" onClick={handleRender3D}>
+          <button id="open-3d-window-btn" title="Render 3D view in popup window" onClick={handleRender3D} data-react-handled="1">
             Open Render
           </button>
           <button
             id="open-system-data-window-btn"
             title="Open System Data in popup window"
             onClick={handleSystemData}
+            data-react-handled="1"
+            type="button"
           >
             Open System Data
           </button>
@@ -152,6 +158,7 @@ export default function MainToolbar() {
             id="optimize-design-intent-btn"
             title="Optimize marked variables (V) to satisfy Requirements (all scenarios)."
             onClick={handleOptimize}
+            data-react-handled="1"
           >
             Optimize
           </button>
@@ -162,6 +169,7 @@ export default function MainToolbar() {
           <select
             id="analysis-select"
             style={{ minWidth: 180 }}
+            data-react-handled="1"
             onChange={(event) => {
               const value = event.currentTarget.value;
               handleAnalysisSelect(value);
@@ -173,6 +181,7 @@ export default function MainToolbar() {
             <option value="spherical-aberration">Spherical Aberration</option>
             <option value="astigmatism">Astigmatism</option>
             <option value="distortion">Distortion</option>
+            <option value="distortion-grid">Distortion Grid</option>
             <option value="magnification-chromatic-aberration">Lateral Chromatic Aberration</option>
             <option value="integrated-aberration">Integrated Aberration</option>
             <option value="transverse-aberration">Transverse Aberration</option>
@@ -228,6 +237,12 @@ export default function MainToolbar() {
           title="Open Distortion in popup window"
         >
           Distortion
+        </button>
+        <button
+          id="open-distortion-grid-window-btn"
+          title="Open Distortion Grid in popup window"
+        >
+          Distortion Grid
         </button>
         <button
           id="open-magnification-chromatic-aberration-window-btn"
