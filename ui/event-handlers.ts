@@ -7337,6 +7337,14 @@ export function setupAnalysisWindows() {
             const progressWrapper = document.getElementById('popup-spherical-progress-wrapper');
             const progressBarEl = document.getElementById('popup-spherical-progressbar');
             const progressTextEl = document.getElementById('popup-spherical-progress-text');
+            const reportPopupError = (label, err) => {
+                try { console.error(label, err); } catch (_) {}
+                try {
+                    if (window.opener && window.opener.console && typeof window.opener.console.error === 'function') {
+                        window.opener.console.error(label, err);
+                    }
+                } catch (_) {}
+            };
 
             const setProgress = (value, text) => {
                 try {
@@ -7364,6 +7372,13 @@ export function setupAnalysisWindows() {
             }
 
             const opener = window.opener;
+            const openerIsTauriRuntime = (() => {
+                try {
+                    return !!(opener && typeof opener.isTauriRuntime === 'function' && opener.isTauriRuntime());
+                } catch (_) {
+                    return false;
+                }
+            })();
             const shouldUseDesktopRust = (() => {
                 try {
                     if (typeof window !== 'undefined' && typeof window['shouldUseDesktopRustAnalysis'] === 'function') {
@@ -7372,17 +7387,19 @@ export function setupAnalysisWindows() {
                     if (opener && typeof opener.shouldUseDesktopRustAnalysis === 'function') {
                         return !!opener.shouldUseDesktopRustAnalysis();
                     }
-                        return true;
+                    // Web build default: do not force desktop-native path.
+                    return false;
                 } catch (_) {
                     return false;
                 }
             })();
-            const canUseDesktopRust = shouldUseDesktopRust && !!(
+            const canUseDesktopRust = openerIsTauriRuntime && shouldUseDesktopRust && !!(
                 opener
                 && typeof opener.runDesktopNativeSphericalAberrationForPopup === 'function'
             );
             try {
                 console.log('📊 [SA TS-Rust] mode', {
+                    openerIsTauriRuntime,
                     canUseDesktopRust,
                     hasNativeRunner: !!(opener && typeof opener.runDesktopNativeSphericalAberrationForPopup === 'function'),
                     referenceFocusMode,
@@ -7409,18 +7426,29 @@ export function setupAnalysisWindows() {
                 }
 
                 if (canUseDesktopRust) {
-                    setProgress(25, 'Computing spherical aberration (Rust)...');
-                    const rustResult = await opener.runDesktopNativeSphericalAberrationForPopup({
-                        rayCount: Number.isFinite(rayCount) ? rayCount : 51,
-                        referenceFocusMode: referenceFocusMode,
-                        wavelengthMode: 'all',
-                    });
-                    setProgress(80, 'Rendering...');
-                    await opener.showLongitudinalAberrationDiagram({
-                        containerElement: containerEl,
-                        onProgress,
-                        precomputedAberrationData: rustResult,
-                    });
+                    try {
+                        setProgress(25, 'Computing spherical aberration (Rust)...');
+                        const rustResult = await opener.runDesktopNativeSphericalAberrationForPopup({
+                            rayCount: Number.isFinite(rayCount) ? rayCount : 51,
+                            referenceFocusMode: referenceFocusMode,
+                            wavelengthMode: 'all',
+                        });
+                        setProgress(80, 'Rendering...');
+                        await opener.showLongitudinalAberrationDiagram({
+                            containerElement: containerEl,
+                            onProgress,
+                            precomputedAberrationData: rustResult,
+                        });
+                    } catch (nativeErr) {
+                        reportPopupError('⚠️ Spherical aberration Rust path failed; retrying Web fallback.', nativeErr);
+                        setProgress(45, 'Rust path failed. Retrying with Web...');
+                        await opener.showLongitudinalAberrationDiagram({
+                            containerElement: containerEl,
+                            onProgress,
+                            rayCount: Number.isFinite(rayCount) ? rayCount : 51,
+                            referenceFocusMode,
+                        });
+                    }
                 } else {
                     // Web fallback: run the existing JS/WASM spherical aberration path.
                     setProgress(25, 'Computing spherical aberration (Web)...');
@@ -7437,10 +7465,13 @@ export function setupAnalysisWindows() {
                 } catch (_) {}
                 return;
             } catch (err) {
-                console.error(err);
+                const errMessage = (err && typeof err === 'object' && 'message' in err)
+                    ? String(err.message)
+                    : String(err || 'Unknown error');
+                reportPopupError('❌ Spherical aberration popup rendering failed:', err);
                 setProgress(100, 'Failed');
                 if (containerEl) {
-                    containerEl.innerHTML = '<div style="padding:20px;color:red;font-family:Arial;">Failed to generate spherical aberration diagram. Check console.</div>';
+                    containerEl.innerHTML = '<div style="padding:20px;color:red;font-family:Arial;">Failed to generate spherical aberration diagram.<br><small style="color:#666;">' + errMessage + '</small></div>';
                 }
             }
         };
