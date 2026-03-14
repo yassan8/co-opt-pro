@@ -140,7 +140,6 @@ import { calculateAdaptiveMarginalRay, calculateAllMarginalRays } from './raytra
 // Analysis modules
 import { derivePupilAndFocalLengthMmFromParaxial, generateSpotDiagram, drawSpotDiagram, generateSurfaceOptions } from './evaluation/spot-diagram.ts';
 import { calculateTransverseAberration, getFieldAnglesFromSource, getPrimaryWavelengthForAberration, validateAberrationData, calculateChiefRayNewton, getEstimatedEntrancePupilDiameter } from './evaluation/aberrations/transverse-aberration.ts';
-import { plotTransverseAberrationDiagram, showTransverseAberrationInNewWindow } from './evaluation/aberrations/transverse-aberration-plot.ts';
 import { showWavefrontDiagram } from './evaluation/wavefront/wavefront-plot.ts';
 import { OpticalPathDifferenceCalculator, WavefrontAberrationAnalyzer, createOPDCalculator, createWavefrontAnalyzer } from './evaluation/wavefront/wavefront.ts';
 import { runOPDProfiling } from './evaluation/wavefront/opd-profiler.ts'; // ✅ OPD profiling functions
@@ -172,6 +171,7 @@ import { setRayEmissionPattern, setRayColorMode, getRayEmissionPattern, getRayCo
 import { setupRayPatternButtons, setupRayColorButtons, setupViewButtons, setupOpticalSystemChangeListeners, setupSimpleViewButtons, setupTransformationControls, updateTransformSurfaceSelect, setupAnalysisWindows } from './ui/event-handlers.ts';
 import { updateSurfaceNumberSelect, updateAllUIElements, initializeUIEventListeners } from './ui/ui-updates.ts';
 import { loadFromCompressedDataHashIfPresent, setupDOMEventHandlers, loadSystemConfigurations, saveSystemConfigurations, loadActiveConfigurationToTables, refreshBlockInspector } from './ui/dom-event-handlers.ts';
+import { openAnalysisWindow } from './ui/toolbar-handlers.ts';
 import { getToolbarCollapsed, setToolbarCollapsed } from './ui/toolbar-collapsed-storage.ts';
 import { updateWavefrontObjectSelect, initializeWavefrontObjectUI, initializePSFObjectUI, debugResetObjectTable } from './ui/wavefront-object-select.ts';
 import { initializeConfigurationUI } from './ui/configuration-handlers.ts';
@@ -728,6 +728,16 @@ async function initializeApplication() {
             }
         };
         window['showIntegratedAberrationDiagram'] = showIntegratedAberrationDiagram;
+        window['__cooptOpenAnalysisWindow'] = async (analysis: string) => {
+            try {
+                const normalized = String(analysis || '').trim();
+                if (!normalized) return false;
+                return await openAnalysisWindow(normalized as any);
+            } catch (err) {
+                console.error('❌ [Analysis] failed to open analysis window bridge:', err);
+                return false;
+            }
+        };
         window['showWavefrontDiagram'] = showWavefrontDiagram;
         window['compareOpdNativeVsWasm'] = async (options: any = {}) => {
             const now = (typeof performance !== 'undefined' && typeof performance.now === 'function')
@@ -3700,6 +3710,7 @@ if (analysisSelect && (analysisSelect as HTMLElement).getAttribute('data-react-h
             'spherical-aberration': 'open-spherical-aberration-window-btn',
             'astigmatism': 'open-astigmatism-window-btn',
             'distortion': 'open-distortion-window-btn',
+            'distortion-grid': 'open-distortion-grid-window-btn',
             'magnification-chromatic-aberration': 'open-magnification-chromatic-aberration-window-btn',
             'integrated-aberration': 'open-integrated-aberration-window-btn',
             'transverse-aberration': 'open-transverse-aberration-window-btn',

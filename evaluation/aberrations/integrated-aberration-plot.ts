@@ -58,6 +58,14 @@ export function plotIntegratedAberrationDiagram(longitudinalData, astigmatismDat
 
     const containerElement = options?.containerElement || null;
     const infoElement = options?.infoElement || null;
+    const defaultOptions = {
+        width: 1440,
+        height: 600,
+        mainTitle: 'Integrated Aberration Diagram',
+        configName: '',
+        ...options
+    };
+    const plotOptions = { ...defaultOptions, ...options };
 
     // popup/container描画モード
     if (containerElement) {
@@ -70,15 +78,6 @@ export function plotIntegratedAberrationDiagram(longitudinalData, astigmatismDat
             return;
         }
 
-        const defaultOptions = {
-            width: 1440,
-            height: 600,
-            mainTitle: 'Integrated Aberration Diagram',
-            configName: '',
-            ...options
-        };
-        const plotOptions = { ...defaultOptions, ...options };
-
         createIntegratedPlot({
             targetWindow,
             plotly,
@@ -88,7 +87,31 @@ export function plotIntegratedAberrationDiagram(longitudinalData, astigmatismDat
         return;
     }
 
-    // legacy: 新しいウィンドウを作成して描画
+    // Legacy no-container path: route to shared analysis window first.
+    try {
+        const openAnalysisWindow = (window as any).__cooptOpenAnalysisWindow;
+        if (typeof openAnalysisWindow === 'function') {
+            void Promise.resolve(openAnalysisWindow('integrated-aberration'));
+            return;
+        }
+    } catch (_) {}
+
+    // Fallback: draw into the in-page container when available.
+    try {
+        const fallbackContainer = document.getElementById('integrated-aberration-container');
+        const fallbackInfo = document.getElementById('integrated-aberration-info-panel');
+        if (fallbackContainer) {
+            createIntegratedPlot({
+                targetWindow: window,
+                plotly: (window as any).Plotly,
+                containerElement: fallbackContainer,
+                infoElement: fallbackInfo
+            }, longitudinalData, astigmatismData, distortionData, lcaData, plotOptions);
+            return;
+        }
+    } catch (_) {}
+
+    // Last-resort legacy popup mode.
     if (typeof Plotly === 'undefined') {
         console.error('❌ Plotly library is not loaded');
         alert('Plotly.js がロードされていません。HTMLファイルにPlotly.jsを含めてください。');
@@ -100,16 +123,6 @@ export function plotIntegratedAberrationDiagram(longitudinalData, astigmatismDat
         alert('ポップアップブロックが有効になっている可能性があります。');
         return;
     }
-
-    const defaultOptions = {
-        width: 1440,
-        height: 600,
-        mainTitle: 'Integrated Aberration Diagram',
-        configName: '',
-        ...options
-    };
-
-    const plotOptions = { ...defaultOptions, ...options };
 
     newWindow.document.write(`
         <!DOCTYPE html>

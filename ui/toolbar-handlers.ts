@@ -10,6 +10,7 @@ import { getLoadedFileName, setLoadedFileName } from './loaded-file-storage.ts';
 import { openJsonFromNativeDialog, openTextFromNativeDialog, saveJsonFromNativeDialog, saveTextFromNativeDialog } from '../src/desktop/adapters/file.ts';
 import { basenameFromPath, isTauriRuntime } from '../src/desktop/runtime.ts';
 import { generateZmxText, getDefaultProject, getNewProjectTemplate, parseZmxText, readDesktopSetting, recommendWavefrontGrid, runAnalysisPreview, writeDesktopSetting } from '../src/desktop/ipc/client.ts';
+import { ANALYSIS_BUTTON_ID_MAP, ANALYSIS_WEB_POPUP_MAP, ANALYSIS_WINDOW_SIZE_MAP, asAnalysisWindowKey, type AnalysisWindowKey } from '../src/shared/analysis-window.ts';
 import { buildShareUrlFromCompressedString, encodeAllDataToCompressedString } from '../utils/url-share.ts';
 
 declare global {
@@ -1538,41 +1539,6 @@ export function handleRender3D(): void {
   }
 }
 
-type AnalysisWindowKey =
-  | 'system-data'
-  | 'spot-diagram'
-  | 'spherical-aberration'
-  | 'astigmatism'
-  | 'distortion'
-  | 'distortion-grid'
-  | 'magnification-chromatic-aberration'
-  | 'integrated-aberration'
-  | 'transverse-aberration'
-  | 'opd'
-  | 'psf'
-  | 'mtf'
-  | 'through-focus-spot'
-  | 'through-focus-mtf'
-  | 'field-mtf';
-
-const ANALYSIS_WINDOW_SIZE_MAP: Record<AnalysisWindowKey, { width: number; height: number; title: string }> = {
-  'system-data': { width: 1200, height: 760, title: 'System Data' },
-  'spot-diagram': { width: 980, height: 760, title: 'Spot Diagram' },
-  'spherical-aberration': { width: 980, height: 760, title: 'Spherical Aberration' },
-  'astigmatism': { width: 980, height: 760, title: 'Astigmatism' },
-  'distortion': { width: 980, height: 760, title: 'Distortion' },
-  'distortion-grid': { width: 980, height: 760, title: 'Distortion Grid' },
-  'magnification-chromatic-aberration': { width: 980, height: 760, title: 'Lateral Chromatic Aberration' },
-  'integrated-aberration': { width: 980, height: 760, title: 'Integrated Aberration' },
-  'transverse-aberration': { width: 980, height: 760, title: 'Transverse Aberration' },
-  'opd': { width: 980, height: 760, title: 'Optical Path Difference' },
-  'psf': { width: 980, height: 760, title: 'Point Spread Function' },
-  'mtf': { width: 980, height: 760, title: 'Modulation Transfer Function' },
-  'through-focus-spot': { width: 1100, height: 820, title: 'Through-Focus Spot' },
-  'through-focus-mtf': { width: 1100, height: 820, title: 'Through-Focus MTF' },
-  'field-mtf': { width: 1100, height: 820, title: 'Object MTF' },
-};
-
 function isAnalysisWindowContext(): boolean {
   try {
     const url = new URL(window.location.href);
@@ -1661,164 +1627,110 @@ async function openDesktopAnalysisWindow(kind: AnalysisWindowKey): Promise<boole
   return true;
 }
 
-export function handleSystemData(): void {
-  console.log('[SystemData] Button clicked');
+function openWebSystemDataWindow(): boolean {
   const w = window as any;
 
-  if (isTauriRuntime() && !isAnalysisWindowContext()) {
-    (async () => {
-      try {
-        await openDesktopAnalysisWindow('system-data');
-      } catch (err) {
-        console.error('❌ [SystemData][Desktop] WebviewWindow error:', err);
-      }
-    })();
-    return;
-  }
-  
-  // Ensure event listeners are set up first
+  // Ensure event listeners are set up first.
   if (typeof w.setupAnalysisWindows === 'function' && typeof w.setupOpticalSystemChangeListeners === 'function') {
     if (!w.__opticalSystemChangeListenersBound) {
-      console.log('[SystemData] Setting up optical system change listeners');
       w.setupOpticalSystemChangeListeners(w.scene || null);
     }
   }
-  
+
   if (w.__systemDataPopup && !w.__systemDataPopup.closed) {
-    try { 
-      console.log('[SystemData] Existing popup found, focusing');
-      w.__systemDataPopup.focus(); 
+    try {
+      w.__systemDataPopup.focus();
+      return true;
     } catch (_) {}
-    return;
   }
-  
-  // Open popup directly
-  const popup = window.open('', 'System Data', 'width=1200,height=600');
+
+  const popupCfg = ANALYSIS_WEB_POPUP_MAP['system-data'];
+  const popup = window.open('', popupCfg.title, popupCfg.features);
   if (!popup) {
     alert('ポップアップがブロックされました。ブラウザのポップアップブロッカーを無効にしてください。\n\nPopup was blocked. Please disable your browser\'s popup blocker.');
-    return;
+    return false;
   }
-  
+
   w.__systemDataPopup = popup;
-  
-  // Initialize the popup
+
   if (typeof w.initializeSystemDataPopup === 'function') {
     w.initializeSystemDataPopup(popup);
-  } else {
-    // Fallback: trigger the button's event listener
-    const btn = document.getElementById('open-system-data-window-btn');
-    if (btn) {
-      const clickEvent = new MouseEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        view: window
-      });
-      // Temporarily remove React's onClick to avoid recursion
-      const reactOnClick = (btn as any).onclick;
-      (btn as any).onclick = null;
-      btn.dispatchEvent(clickEvent);
-      setTimeout(() => {
-        (btn as any).onclick = reactOnClick;
-      }, 0);
+    return true;
+  }
+
+  return false;
+}
+
+function openWebAnalysisWindow(kind: AnalysisWindowKey): boolean {
+  if (kind === 'system-data') {
+    return openWebSystemDataWindow();
+  }
+
+  const w = window as any;
+  const buttonId = ANALYSIS_BUTTON_ID_MAP[kind];
+  if (!buttonId) return false;
+
+  let preopenedPopup: Window | null = null;
+  const popupCfg = ANALYSIS_WEB_POPUP_MAP[kind];
+  try {
+    const preopened = window.open('', popupCfg.title, popupCfg.features);
+    if (preopened) {
+      preopenedPopup = preopened;
+      w.__preopenedAnalysisPopupMap = w.__preopenedAnalysisPopupMap || {};
+      w.__preopenedAnalysisPopupMap[popupCfg.title] = preopened;
+    }
+  } catch (_) {}
+
+  try {
+    if (typeof w.setupAnalysisWindows === 'function') {
+      w.setupAnalysisWindows();
+    }
+  } catch (_) {}
+
+  const button = document.getElementById(buttonId);
+  if (button) {
+    const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+    button.dispatchEvent(clickEvent);
+  } else if (preopenedPopup) {
+    try { preopenedPopup.close(); } catch (_) {}
+  }
+
+  if (preopenedPopup) {
+    try {
+      const store = w.__preopenedAnalysisPopupMap;
+      if (store && store[popupCfg.title] === preopenedPopup) {
+        delete store[popupCfg.title];
+      }
+    } catch (_) {}
+  }
+
+  return !!button;
+}
+
+export async function openAnalysisWindow(kind: AnalysisWindowKey): Promise<boolean> {
+  if (isTauriRuntime() && !isAnalysisWindowContext()) {
+    try {
+      return await openDesktopAnalysisWindow(kind);
+    } catch (err) {
+      console.error('❌ [Analysis][Desktop] WebviewWindow error:', err);
+      return false;
     }
   }
+
+  return openWebAnalysisWindow(kind);
+}
+
+export function handleSystemData(): void {
+  console.log('[SystemData] Button clicked');
+  void openAnalysisWindow('system-data');
 }
 
 export function handleAnalysisSelect(selectedValue: string): void {
   const value = String(selectedValue || '').trim();
   if (!value) return;
-
-  const analysisPopupConfigMap: Record<string, { key: string; title: string; features: string }> = {
-    'spot-diagram': { key: 'spot-diagram', title: 'Spot Diagram', features: 'width=800,height=600' },
-    'spherical-aberration': { key: 'spherical-aberration', title: 'Spherical Aberration', features: 'width=800,height=600' },
-    'astigmatism': { key: 'astigmatism', title: 'Astigmatism', features: 'width=800,height=600' },
-    'distortion': { key: 'distortion', title: 'Distortion', features: 'width=800,height=600' },
-    'distortion-grid': { key: 'distortion-grid', title: 'Distortion Grid', features: 'width=800,height=600' },
-    'magnification-chromatic-aberration': { key: 'magnification-chromatic-aberration', title: 'Lateral Chromatic Aberration', features: 'width=800,height=600' },
-    'integrated-aberration': { key: 'integrated-aberration', title: 'Integrated Aberration', features: 'width=800,height=600' },
-    'transverse-aberration': { key: 'transverse-aberration', title: 'Transverse Aberration', features: 'width=800,height=600' },
-    'opd': { key: 'opd', title: 'Optical Path Difference', features: 'width=800,height=600' },
-    'psf': { key: 'psf', title: 'Point Spread Function', features: 'width=800,height=600' },
-    'mtf': { key: 'mtf', title: 'Modulation Transfer Function', features: 'width=800,height=600' },
-    'through-focus-spot': { key: 'through-focus-spot', title: 'Through-Focus Spot', features: 'width=980,height=700' },
-    'through-focus-mtf': { key: 'through-focus-mtf', title: 'Through-Focus MTF', features: 'width=900,height=680' },
-    'field-mtf': { key: 'field-mtf', title: 'Object MTF', features: 'width=900,height=650' }
-  };
-
-  const analysisButtonMap: Record<string, string> = {
-    'spot-diagram': 'open-spot-diagram-window-btn',
-    'spherical-aberration': 'open-spherical-aberration-window-btn',
-    'astigmatism': 'open-astigmatism-window-btn',
-    'distortion': 'open-distortion-window-btn',
-    'distortion-grid': 'open-distortion-grid-window-btn',
-    'magnification-chromatic-aberration': 'open-magnification-chromatic-aberration-window-btn',
-    'integrated-aberration': 'open-integrated-aberration-window-btn',
-    'transverse-aberration': 'open-transverse-aberration-window-btn',
-    'opd': 'open-opd-window-btn',
-    'psf': 'open-psf-window-btn',
-    'mtf': 'open-mtf-window-btn',
-    'through-focus-spot': 'open-through-focus-spot-window-btn',
-    'through-focus-mtf': 'open-through-focus-mtf-window-btn',
-    'field-mtf': 'open-field-mtf-window-btn'
-  };
-
-  const buttonId = analysisButtonMap[value];
-
-  const mappedAnalysisKind = (
-    value in ANALYSIS_WINDOW_SIZE_MAP ? value : null
-  ) as AnalysisWindowKey | null;
-
-  if (isTauriRuntime() && !isAnalysisWindowContext() && mappedAnalysisKind && buttonId) {
-    (async () => {
-      try {
-        await openDesktopAnalysisWindow(mappedAnalysisKind);
-      } catch (err) {
-        console.error('❌ [Analysis][Desktop] WebviewWindow error:', err);
-      }
-    })();
-    return;
-  }
-
-  if (buttonId) {
-    const w = window as any;
-    let preopenedPopup: Window | null = null;
-    let preopenedTitle = '';
-    try {
-      const cfg = analysisPopupConfigMap[value];
-      if (cfg) {
-        const preopened = window.open('', cfg.title, cfg.features);
-        if (preopened) {
-          preopenedPopup = preopened;
-          preopenedTitle = cfg.title;
-          w.__preopenedAnalysisPopupMap = w.__preopenedAnalysisPopupMap || {};
-          w.__preopenedAnalysisPopupMap[cfg.title] = preopened;
-        }
-      }
-    } catch (_) {}
-
-    try {
-      if (typeof w.setupAnalysisWindows === 'function') {
-        w.setupAnalysisWindows();
-      }
-    } catch (_) {}
-
-    const button = document.getElementById(buttonId);
-    if (button) {
-      const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
-      button.dispatchEvent(clickEvent);
-    } else if (preopenedPopup) {
-      // If no target button exists, clean up the preopened blank popup.
-      try { preopenedPopup.close(); } catch (_) {}
-    }
-
-    if (preopenedPopup && preopenedTitle) {
-      try {
-        const store = w.__preopenedAnalysisPopupMap;
-        if (store && store[preopenedTitle] === preopenedPopup) {
-          delete store[preopenedTitle];
-        }
-      } catch (_) {}
-    }
+  const kind = asAnalysisWindowKey(value);
+  if (kind) {
+    void openAnalysisWindow(kind);
   }
 
   if (isTauriRuntime()) {

@@ -678,7 +678,21 @@ function convertLegacyDataFormat(legacyData) {
 export function showTransverseAberrationInNewWindow(aberrationData) {
     console.log('🚀 新しいウィンドウで横収差図を表示します');
 
-    // 1. 新しいウィンドウを開く
+    try {
+        const openAnalysisWindow = (window as any).__cooptOpenAnalysisWindow;
+        if (typeof openAnalysisWindow === 'function') {
+            void Promise.resolve(openAnalysisWindow('transverse-aberration'));
+            return;
+        }
+    } catch (_) {}
+
+    // Legacy fallback: draw in the in-page analysis container.
+    try {
+        plotTransverseAberrationDiagram(aberrationData, 'transverse-aberration-container', document);
+        return;
+    } catch (_) {}
+
+    // Last-resort fallback for environments where the shared bridge is unavailable.
     const newWindow = window.open('', '_blank', 'width=1200,height=800,resizable=yes,scrollbars=yes');
     if (!newWindow) {
         console.error('❌ ポップアップウィンドウを開けませんでした。ポップアップブロッカーを確認してください。');

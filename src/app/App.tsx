@@ -13,6 +13,7 @@ import { handleOpenSettings } from "../../ui/toolbar-handlers";
 import { runOptimizationMVP } from "../../optimization/optimizer-mvp.ts";
 import { clearOptimizerStop, readDesktopSetting, writeDesktopSetting } from "../../src/desktop/ipc/client.ts";
 import { isTauriRuntime } from "../../src/desktop/runtime.ts";
+import { asAnalysisWindowKey } from "../shared/analysis-window";
 
 // ---- Settings window page component ----
 const FORCE_MODE_KEY = 'coopt.forceInfinitePupilMode';
@@ -158,7 +159,8 @@ export default function App() {
     try {
       const url = new URL(window.location.href);
       const enabled = url.searchParams.get('coopt_analysis_window') === '1';
-      const analysis = String(url.searchParams.get('coopt_analysis') || '').trim();
+      const rawAnalysis = String(url.searchParams.get('coopt_analysis') || '').trim();
+      const analysis = asAnalysisWindowKey(rawAnalysis) || rawAnalysis;
       return { enabled, analysis };
     } catch (_) {
       return { enabled: false, analysis: '' };

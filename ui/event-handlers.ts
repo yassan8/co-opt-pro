@@ -7629,9 +7629,12 @@ export function setupAnalysisWindows() {
             };
 
             try {
-                if (!window.opener || typeof window.opener.showAstigmatismDiagram !== 'function') {
-                    throw new Error('showAstigmatismDiagram is not available on opener');
-                }
+                const hostWindow = (() => {
+                    try { if (typeof window.showAstigmatismDiagram === 'function') return window; } catch (_) {}
+                    try { if (window.opener && typeof window.opener.showAstigmatismDiagram === 'function') return window.opener; } catch (_) {}
+                    return null;
+                })();
+                if (!hostWindow) throw new Error('showAstigmatismDiagram is not available on window/opener');
                 setProgress(0, 'Starting...');
                 const onProgress = (evt) => {
                     try {
@@ -7642,7 +7645,7 @@ export function setupAnalysisWindows() {
                         else setProgress(undefined, msg);
                     } catch (_) {}
                 };
-                await window.opener.showAstigmatismDiagram({
+                await hostWindow.showAstigmatismDiagram({
                     containerElement: containerEl,
                     rayCount,
                     ringCount,
@@ -7876,9 +7879,12 @@ export function setupAnalysisWindows() {
             let renderSucceeded = false;
 
             try {
-                if (!window.opener || typeof window.opener.runPortableDistortionDataForPopup !== 'function') {
-                    throw new Error('runPortableDistortionDataForPopup is not available on opener');
-                }
+                const hostWindow = (() => {
+                    try { if (typeof window.runPortableDistortionDataForPopup === 'function') return window; } catch (_) {}
+                    try { if (window.opener && typeof window.opener.runPortableDistortionDataForPopup === 'function') return window.opener; } catch (_) {}
+                    return null;
+                })();
+                if (!hostWindow) throw new Error('runPortableDistortionDataForPopup is not available on window/opener');
                 setProgress(0, 'Starting...');
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 const onProgress = (evt) => {
@@ -7889,7 +7895,7 @@ export function setupAnalysisWindows() {
                         else setProgress(undefined, msg);
                     } catch (_) {}
                 };
-                const result = await window.opener.runPortableDistortionDataForPopup({ onProgress });
+                const result = await hostWindow.runPortableDistortionDataForPopup({ onProgress });
                 const allData = Array.isArray(result?.allData) ? result.allData : [];
                 await plotDistortionLocal(allData, percentEl);
                 renderSucceeded = true;
@@ -8201,9 +8207,12 @@ export function setupAnalysisWindows() {
             let renderSucceeded = false;
 
             try {
-                if (!window.opener || typeof window.opener.runPortableGridDistortionForPopup !== 'function') {
-                    throw new Error('runPortableGridDistortionForPopup is not available on opener');
-                }
+                const hostWindow = (() => {
+                    try { if (typeof window.runPortableGridDistortionForPopup === 'function') return window; } catch (_) {}
+                    try { if (window.opener && typeof window.opener.runPortableGridDistortionForPopup === 'function') return window.opener; } catch (_) {}
+                    return null;
+                })();
+                if (!hostWindow) throw new Error('runPortableGridDistortionForPopup is not available on window/opener');
                 setProgress(0, 'Starting...');
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 const onProgress = (evt) => {
@@ -8214,7 +8223,7 @@ export function setupAnalysisWindows() {
                         else setProgress(undefined, msg);
                     } catch (_) {}
                 };
-                const data = await window.opener.runPortableGridDistortionForPopup({ gridSize: Number.isFinite(gridSize) ? gridSize : 20, onProgress });
+                const data = await hostWindow.runPortableGridDistortionForPopup({ gridSize: Number.isFinite(gridSize) ? gridSize : 20, onProgress });
                 await plotGridLocal(data, gridEl, onProgress);
                 renderSucceeded = true;
                 setTimeout(resizePlot, 0);
@@ -8412,9 +8421,12 @@ export function setupAnalysisWindows() {
             const chiefRayDefinition = (chiefRayEl && chiefRayEl.value) ? chiefRayEl.value : 'stop-center';
 
             try {
-                if (!window.opener || typeof window.opener.showMagnificationChromaticAberrationDiagram !== 'function') {
-                    throw new Error('showMagnificationChromaticAberrationDiagram is not available on opener');
-                }
+                const hostWindow = (() => {
+                    try { if (typeof window.showMagnificationChromaticAberrationDiagram === 'function') return window; } catch (_) {}
+                    try { if (window.opener && typeof window.opener.showMagnificationChromaticAberrationDiagram === 'function') return window.opener; } catch (_) {}
+                    return null;
+                })();
+                if (!hostWindow) throw new Error('showMagnificationChromaticAberrationDiagram is not available on window/opener');
                 setProgress(0, 'Starting...');
                 const onProgress = (evt) => {
                     try {
@@ -8424,7 +8436,7 @@ export function setupAnalysisWindows() {
                         else setProgress(undefined, msg);
                     } catch (_) {}
                 };
-                await window.opener.showMagnificationChromaticAberrationDiagram({
+                await hostWindow.showMagnificationChromaticAberrationDiagram({
                     containerElement: containerEl,
                     xMin,
                     xMax,
@@ -8546,8 +8558,17 @@ export function setupAnalysisWindows() {
             };
 
             try {
-                if (!window.opener || typeof window.opener.showIntegratedAberrationDiagram !== 'function') {
-                    throw new Error('showIntegratedAberrationDiagram is not available on opener');
+                const hostWindow = (() => {
+                    try {
+                        if (typeof window.showIntegratedAberrationDiagram === 'function') return window;
+                    } catch (_) {}
+                    try {
+                        if (window.opener && typeof window.opener.showIntegratedAberrationDiagram === 'function') return window.opener;
+                    } catch (_) {}
+                    return null;
+                })();
+                if (!hostWindow) {
+                    throw new Error('showIntegratedAberrationDiagram is not available on window/opener');
                 }
                 setProgress(0, 'Starting...');
                 const onProgress = (evt) => {
@@ -8558,7 +8579,7 @@ export function setupAnalysisWindows() {
                         else setProgress(undefined, msg);
                     } catch (_) {}
                 };
-                await window.opener.showIntegratedAberrationDiagram({
+                await hostWindow.showIntegratedAberrationDiagram({
                     containerElement: containerEl,
                     onProgress,
                     useActiveConfigSnapshot: true
@@ -9069,12 +9090,17 @@ export function setupAnalysisWindows() {
                 };
                 
                 try {
-                    if (!window.opener || typeof window.opener.showWavefrontDiagram !== 'function') {
+                    const hostWindow = (() => {
+                        try { if (typeof window.showWavefrontDiagram === 'function') return window; } catch (_) {}
+                        try { if (window.opener && typeof window.opener.showWavefrontDiagram === 'function') return window.opener; } catch (_) {}
+                        return null;
+                    })();
+                    if (!hostWindow) {
                         try { opdStageTrace.push('Blocked', 'showWavefrontDiagram is unavailable'); } catch (_) {}
-                        throw new Error('showWavefrontDiagram is not available on opener');
+                        throw new Error('showWavefrontDiagram is not available on window/opener');
                     }
-                    try { opdStageTrace.push('Wavefront call started', 'Delegating to opener.showWavefrontDiagram'); } catch (_) {}
-                    const wavefrontResult = await window.opener.showWavefrontDiagram(plotType, 'opd', Number.isFinite(gridSize) ? gridSize : 256, Number.isFinite(objectIndex) ? objectIndex : 0, {
+                    try { opdStageTrace.push('Wavefront call started', 'Delegating to showWavefrontDiagram'); } catch (_) {}
+                    const wavefrontResult = await hostWindow.showWavefrontDiagram(plotType, 'opd', Number.isFinite(gridSize) ? gridSize : 256, Number.isFinite(objectIndex) ? objectIndex : 0, {
                         containerElement: containerEl,
                         cancelToken: popupCancelToken,
                         onProgress,
@@ -10259,12 +10285,16 @@ export function setupAnalysisWindows() {
                     const preferNativeOpdMap = (typeof window !== 'undefined' && window.__PSF_POPUP_USE_NATIVE_OPD_MAP === false)
                         ? false
                         : true;
-                    const canUseNativeOpdMap = !forceJsOpdMap && preferNativeOpdMap
-                        && !!(window.opener && typeof window.opener.runDesktopNativeOpdMapForPopup === 'function');
+                    const _nativeOpdMapHost = (() => {
+                        try { if (typeof window.runDesktopNativeOpdMapForPopup === 'function') return window; } catch (_) {}
+                        try { if (window.opener && typeof window.opener.runDesktopNativeOpdMapForPopup === 'function') return window.opener; } catch (_) {}
+                        return null;
+                    })();
+                    const canUseNativeOpdMap = !forceJsOpdMap && preferNativeOpdMap && !!_nativeOpdMapHost;
 
                     if (canUseNativeOpdMap) {
                         try {
-                            nativeOpdResp = await raceWithCancel(window.opener.runDesktopNativeOpdMapForPopup({
+                            nativeOpdResp = await raceWithCancel(_nativeOpdMapHost.runDesktopNativeOpdMapForPopup({
                                 objectIndex: idx,
                                 gridSize: wavefrontGridSize,
                                 wavelengthUm: wavelength,
@@ -10927,7 +10957,12 @@ export function setupAnalysisWindows() {
                         : (zeroPadRaw === 'auto')
                             ? 0
                             : (Number.isFinite(parseInt(zeroPadRaw)) ? parseInt(zeroPadRaw) : 0);
-                    const canUseNativePsfMap = !!(window.opener && typeof window.opener.runDesktopNativePsfMapForPopup === 'function');
+                    const _nativePsfMapHost = (() => {
+                        try { if (typeof window.runDesktopNativePsfMapForPopup === 'function') return window; } catch (_) {}
+                        try { if (window.opener && typeof window.opener.runDesktopNativePsfMapForPopup === 'function') return window.opener; } catch (_) {}
+                        return null;
+                    })();
+                    const canUseNativePsfMap = !!_nativePsfMapHost;
                     if (!canUseNativePsfMap) {
                         throw new Error('Native Rust PSF map path is required but unavailable.');
                     }
@@ -10940,7 +10975,7 @@ export function setupAnalysisWindows() {
                     const pixelSizeUm = basePixelPitchUm * (psfSamplingSize / requestedFftSize);
 
                     onProgress({ percent: 80, phase: 'psf', message: 'PSF (native)...' });
-                    const nativePsfResp = await raceWithCancel(window.opener.runDesktopNativePsfMapForPopup({
+                    const nativePsfResp = await raceWithCancel(_nativePsfMapHost.runDesktopNativePsfMapForPopup({
                         gridOpd: Array.from({ length: s }, (_, iy) => Array.from(opdGrid[iy] || [])),
                         gridAmplitude: Array.from({ length: s }, (_, iy) => Array.from(ampGrid[iy] || [])),
                         pupilMask: Array.from({ length: s }, (_, iy) => Array.from(maskGrid[iy] || [])),
@@ -13842,11 +13877,20 @@ export function setupAnalysisWindows() {
             if (containerEl) containerEl.innerHTML = '';
 
             try {
-                if (!window.opener || typeof window.opener.showTransverseAberrationDiagram !== 'function') {
-                    throw new Error('showTransverseAberrationDiagram is not available on opener');
+                const hostWindow = (() => {
+                    try {
+                        if (typeof window.showTransverseAberrationDiagram === 'function') return window;
+                    } catch (_) {}
+                    try {
+                        if (window.opener && typeof window.opener.showTransverseAberrationDiagram === 'function') return window.opener;
+                    } catch (_) {}
+                    return null;
+                })();
+                if (!hostWindow) {
+                    throw new Error('showTransverseAberrationDiagram is not available on window/opener');
                 }
                 setProgress(0, 'Starting...');
-                await window.opener.showTransverseAberrationDiagram({
+                await hostWindow.showTransverseAberrationDiagram({
                     rayCount: Number.isFinite(rayCount) ? rayCount : 51,
                     containerElement: containerEl,
                     onProgress
