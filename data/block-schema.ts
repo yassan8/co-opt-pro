@@ -1702,7 +1702,7 @@ export function expandBlocksToOpticalSystemRows(blocks: Block[]): { rows: any[];
         return Math.trunc(n);
       })();
 
-      // Coord Trans field reuse (see specification/ray-tracing.md)
+        // Coord Trans values are reused in legacy row fields.
       cb.semidia = normalizeOptionalNumberToRowValue(decenterX);
       cb.material = normalizeOptionalNumberToRowValue(decenterY);
       cb.thickness = (() => {

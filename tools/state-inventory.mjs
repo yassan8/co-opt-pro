@@ -7,8 +7,8 @@
  * - window.* export assignments (window.<prop> assignment patterns)
  *
  * Output:
- * - documentation/STATE_INVENTORY_REPORT.md
- * - documentation/STATE_INVENTORY_REPORT.json
+ * - STATE_INVENTORY_REPORT.md
+ * - STATE_INVENTORY_REPORT.json
  */
 
 import fs from 'node:fs/promises';
@@ -239,10 +239,9 @@ async function main() {
 
   const reportMd = renderMarkdown(out);
 
-  const mdPath = path.join(projectRoot, 'documentation', 'STATE_INVENTORY_REPORT.md');
-  const jsonPath = path.join(projectRoot, 'documentation', 'STATE_INVENTORY_REPORT.json');
+  const mdPath = path.join(projectRoot, 'STATE_INVENTORY_REPORT.md');
+  const jsonPath = path.join(projectRoot, 'STATE_INVENTORY_REPORT.json');
 
-  await fs.mkdir(path.dirname(mdPath), { recursive: true });
   await fs.writeFile(mdPath, reportMd, 'utf8');
   await fs.writeFile(jsonPath, JSON.stringify(reportJson, null, 2) + '\n', 'utf8');
 
