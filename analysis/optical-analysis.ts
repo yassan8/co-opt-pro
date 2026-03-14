@@ -19,6 +19,8 @@ import { loadTableData as loadSourceTableData } from '../data/table-source.ts';
 import { detectConjugateType } from '../utils/conjugate-detection.ts';
 import { generateRayStartPointsForObject } from '../optical/ray-renderer.ts';
 import { getSpotDiagramPattern, loadSpotDiagramSettingsByConfigId, saveSpotDiagramSettingsByConfigId, saveLastSpotDiagramSettings } from '../ui/spot-diagram-settings-storage.ts';
+import { runNativeMagnificationChromaticAberration } from '../src/desktop/ipc/client.ts';
+import { plotMagnificationChromaticAberration } from '../evaluation/aberrations/magnification-chromatic-aberration-plot.ts';
 import { getScene, getCamera, getRenderer, getControls, getTableOpticalSystem, getTableObject, getTableSource,
          getIsGeneratingSpotDiagram, getIsGeneratingTransverseAberration,
          setIsGeneratingSpotDiagram, setIsGeneratingTransverseAberration } from '../core/app-config.ts';
@@ -2630,6 +2632,9 @@ export async function showMagnificationChromaticAberrationDiagram(options: any =
     const chiefRayDefinition = (options && typeof options === 'object' && typeof options.chiefRayDefinition === 'string')
         ? options.chiefRayDefinition
         : 'stop-center';
+    const precomputedAberrationData = (options && typeof options === 'object')
+        ? (options as any).precomputedAberrationData
+        : null;
 
     let containerTarget: any = 'magnification-chromatic-aberration-container';
     if (options && typeof options === 'object') {
@@ -2654,6 +2659,24 @@ export async function showMagnificationChromaticAberrationDiagram(options: any =
         if (xMin >= xMax) {
             xMin = -0.05;
             xMax = 0.05;
+        }
+
+        if (precomputedAberrationData && typeof precomputedAberrationData === 'object') {
+            try { onProgress?.({ percent: 90, message: 'Rendering...' }); } catch (_) {}
+            const plotted = plotMagnificationChromaticAberration(
+                precomputedAberrationData,
+                containerTarget,
+                { xMin, xMax }
+            );
+            if (!plotted) {
+                throw new Error('倍率色収差: 描画可能な有効データがありません');
+            }
+            try {
+                console.log('📊 [LCA] backend:', (precomputedAberrationData as any)?.backend || (precomputedAberrationData as any)?.meta?.backend || 'unknown');
+            } catch (_) {}
+            try { onProgress?.({ percent: 100, message: 'Done' }); } catch (_) {}
+            console.log('✅ Lateral chromatic aberration diagram generated successfully');
+            return;
         }
 
         const tableOpticalSystem = getTableOpticalSystem();
@@ -2736,20 +2759,17 @@ export async function showMagnificationChromaticAberrationDiagram(options: any =
             for (const row of rows) {
                 const wl = normalizeUm(row?.wavelength ?? row?.Wavelength);
                 if (wl === null) continue;
-                if (!unique.some(w => Math.abs(w - wl) < 1e-12)) unique.push(wl);
+                if (!unique.some(w => Math.abs(w - wl) < 1e-4)) unique.push(wl);
                 if (unique.length >= 6) break;
             }
             return unique.length > 0 ? unique : fallbackWavelengths.slice();
         })();
 
         const referenceWavelength = 0.5876;
-        if (!wavelengths.some(w => Math.abs(w - referenceWavelength) < 1e-6)) {
+        if (!wavelengths.some(w => Math.abs(w - referenceWavelength) < 1e-4)) {
             wavelengths.push(referenceWavelength);
             wavelengths.sort((a, b) => a - b);
         }
-
-        const { runNativeMagnificationChromaticAberration } = await import('../src/desktop/ipc/client.ts');
-        const { plotMagnificationChromaticAberration } = await import('../evaluation/aberrations/magnification-chromatic-aberration-plot.js');
 
         const data = await runNativeMagnificationChromaticAberration({
             opticalSystemRows,

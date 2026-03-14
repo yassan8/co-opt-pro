@@ -29,6 +29,7 @@ export const optimize_system_in_wasm: (a: number, b: number) => [number, number,
 export const qr_factorization: (a: number, b: number, c: number, d: number) => [number, number];
 export const reflect_ray_batch: (a: number, b: number, c: number, d: number, e: number) => [number, number];
 export const refract_ray_batch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
+export const run_native_distortion_wasm_json: (a: number, b: number) => [number, number, number];
 export const run_native_magnification_chromatic_aberration_wasm_json: (a: number, b: number) => [number, number, number];
 export const run_native_opd_map_wasm_json: (a: number, b: number) => [number, number, number];
 export const solve_linear_system: (a: number, b: number, c: number, d: number, e: number) => [number, number];

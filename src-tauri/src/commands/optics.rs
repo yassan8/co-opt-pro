@@ -6185,6 +6185,7 @@ fn lca_fill_missing_linear(field_values: &[f64], values: &mut [Option<f64>]) {
 fn run_native_magnification_chromatic_aberration_impl(
     req: NativeMagnificationChromaticAberrationRequest,
 ) -> Result<NativeMagnificationChromaticAberrationResponse, String> {
+    let wavelength_eq_tol = 1.0e-4_f64;
     if req.optical_system_rows.is_empty() {
         return Err("run_native_magnification_chromatic_aberration: opticalSystemRows is empty".to_string());
     }
@@ -6233,11 +6234,21 @@ fn run_native_magnification_chromatic_aberration_impl(
             .collect();
     }
 
-    let reference_wavelength = req
+    let mut reference_wavelength = req
         .reference_wavelength
         .filter(|w| w.is_finite() && *w > 0.0)
         .unwrap_or(0.5876);
-    if !wavelengths.iter().any(|w| (*w - reference_wavelength).abs() < 1e-9) {
+    if let Some(wl) = wavelengths
+        .iter()
+        .copied()
+        .find(|w| (*w - reference_wavelength).abs() < wavelength_eq_tol)
+    {
+        reference_wavelength = wl;
+    }
+    if !wavelengths
+        .iter()
+        .any(|w| (*w - reference_wavelength).abs() < wavelength_eq_tol)
+    {
         wavelengths.push(reference_wavelength);
     }
     wavelengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -6330,7 +6341,7 @@ fn run_native_magnification_chromatic_aberration_impl(
 
     let reference_heights = wavelength_heights
         .iter()
-        .find(|(wl, _)| (*wl - reference_wavelength).abs() < 1e-9)
+        .find(|(wl, _)| (*wl - reference_wavelength).abs() < wavelength_eq_tol)
         .map(|(_, h)| h.clone())
         .ok_or_else(|| "run_native_magnification_chromatic_aberration: failed to compute reference wavelength".to_string())?;
 

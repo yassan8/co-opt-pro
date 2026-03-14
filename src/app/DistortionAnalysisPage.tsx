@@ -291,6 +291,7 @@ export function DistortionAnalysisPage({ type }: { type: DistortionAnalysisType 
       const scales = [1.0, 0.7, 0.5, 0.35, 0.2];
       let bestData: any[] = [];
       let bestFinite = 0;
+      const totalExpected = fieldValues.length * Math.max(1, wavelengths.length);
       for (let si = 0; si < scales.length; si++) {
         const scale = scales[si];
         const scaledFields = scaleFieldValues(fieldValues, scale);
@@ -323,7 +324,7 @@ export function DistortionAnalysisPage({ type }: { type: DistortionAnalysisType 
           bestFinite = finiteCount;
           bestData = sanitized;
         }
-        if (finiteCount > 0) break;
+        if (finiteCount >= totalExpected) break;
       }
       if (!bestData.length) {
         throw new Error('Distortion returned no plottable points (all chief rays failed).');
@@ -347,6 +348,7 @@ export function DistortionAnalysisPage({ type }: { type: DistortionAnalysisType 
       const scales = [1.0, 0.7, 0.5, 0.35, 0.2];
       let data: any = null;
       let bestValid = -1;
+      const expectedGridPoints = (Number(gridSize) || 20) * (Number(gridSize) || 20);
       for (let si = 0; si < scales.length; si++) {
         const scale = scales[si];
         const scaledObjects = scaleObjectRowsForGrid(objectRows, scale);
@@ -376,7 +378,7 @@ export function DistortionAnalysisPage({ type }: { type: DistortionAnalysisType 
           data = candidate;
         }
         setProgress(20 + Math.floor((si / Math.max(1, scales.length)) * 20), `Grid distortion retry scale=${scale.toFixed(2)} (valid=${valid})`);
-        if (valid > 0) break;
+        if (valid >= expectedGridPoints) break;
       }
       if (!data) throw new Error('Grid distortion returned no data');
       setProgress(40, `Grid distortion ${data.gridSize}×${data.gridSize}`);

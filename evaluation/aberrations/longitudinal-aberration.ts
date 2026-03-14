@@ -22,6 +22,13 @@ import { getObjectRows } from '../../utils/data-utils.ts';
 import { calculateBackFocalLength, getRefractiveIndex } from '../../raytracing/core/ray-paraxial.ts';
 import { setWindowDebugBagValue } from '../../utils/window-debug-bag.ts';
 
+const SA_TRACE_OPTIONS = {
+    // SA should keep running even when strict wasm rt10 symbol is missing on web.
+    allowNonStrict: true,
+    requireRustWasm: false,
+    requireForwardHit: false,
+};
+
 function applyRotationMatrixToVector(matrix, v) {
     if (!matrix) return { x: v.x, y: v.y, z: v.z };
     const x = matrix[0][0] * v.x + matrix[0][1] * v.y + matrix[0][2] * v.z;
@@ -84,7 +91,7 @@ function solveRayDirectionToStopPointFast(centerPoint, stopTarget3d, stopSurface
 
         const dir = buildDirFromSlopes(u, v);
         const ray = { wavelength: wavelengthUm, pos: { ...centerPoint }, dir };
-        const hit = traceRayHitPoint(opticalSystemRows, ray, 1.0, stopIdx);
+        const hit = traceRayHitPoint(opticalSystemRows, ray, 1.0, stopIdx, SA_TRACE_OPTIONS);
         if (!hit) return null;
 
         const ex = Number(hit.x) - Number(stopTarget3d.x);
@@ -97,13 +104,15 @@ function solveRayDirectionToStopPointFast(centerPoint, stopTarget3d, stopSurface
             opticalSystemRows,
             { wavelength: wavelengthUm, pos: { ...centerPoint }, dir: buildDirFromSlopes(u + eps, v) },
             1.0,
-            stopIdx
+            stopIdx,
+            SA_TRACE_OPTIONS
         );
         const hitV = traceRayHitPoint(
             opticalSystemRows,
             { wavelength: wavelengthUm, pos: { ...centerPoint }, dir: buildDirFromSlopes(u, v + eps) },
             1.0,
-            stopIdx
+            stopIdx,
+            SA_TRACE_OPTIONS
         );
         if (!hitU || !hitV) return null;
 
@@ -158,7 +167,8 @@ function solveRayOriginToStopPointFast(initialOrigin, dirVector, stopTarget3d, s
         opticalSystemRows,
         { wavelength: wavelengthUm, pos: { ...o }, dir: { ...baseDir } },
         1.0,
-        stopIdx
+        stopIdx,
+        SA_TRACE_OPTIONS
     );
 
     for (let iter = 0; iter < maxIter; iter++) {
@@ -387,7 +397,7 @@ function buildNormalizedPupilSamples(rayCount) {
 
 function traceRayWrapped(opticalSystemRows, ray0, targetSurfaceIndex, originalRayMeta) {
     try {
-        const rayPath = traceRay(opticalSystemRows, ray0, 1.0, null, targetSurfaceIndex);
+        const rayPath = traceRay(opticalSystemRows, ray0, 1.0, null, targetSurfaceIndex, SA_TRACE_OPTIONS);
         const success = Array.isArray(rayPath) && rayPath.length > 1;
         return {
             success,

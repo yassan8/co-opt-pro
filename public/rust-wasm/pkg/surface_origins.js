@@ -522,6 +522,20 @@ export function refract_ray_batch(dirs, normals, n1, n2, count) {
  * @param {string} req_json
  * @returns {any}
  */
+export function run_native_distortion_wasm_json(req_json) {
+    const ptr0 = passStringToWasm0(req_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.run_native_distortion_wasm_json(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {string} req_json
+ * @returns {any}
+ */
 export function run_native_magnification_chromatic_aberration_wasm_json(req_json) {
     const ptr0 = passStringToWasm0(req_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
@@ -962,6 +976,10 @@ function __wbg_get_imports() {
             const ret = typeof(arg0) === 'function';
             return ret;
         },
+        __wbg___wbindgen_is_null_ac34f5003991759a: function(arg0) {
+            const ret = arg0 === null;
+            return ret;
+        },
         __wbg___wbindgen_is_object_5ae8e5880f2c1fbd: function(arg0) {
             const val = arg0;
             const ret = typeof(val) === 'object' && val !== null;
@@ -969,6 +987,10 @@ function __wbg_get_imports() {
         },
         __wbg___wbindgen_is_string_cd444516edc5b180: function(arg0) {
             const ret = typeof(arg0) === 'string';
+            return ret;
+        },
+        __wbg___wbindgen_is_undefined_9e4d92534c42d778: function(arg0) {
+            const ret = arg0 === undefined;
             return ret;
         },
         __wbg___wbindgen_jsval_eq_11888390b0186270: function(arg0, arg1) {
@@ -1012,6 +1034,10 @@ function __wbg_get_imports() {
             const ret = Object.entries(arg0);
             return ret;
         },
+        __wbg_from_bddd64e7d5ff6941: function(arg0) {
+            const ret = Array.from(arg0);
+            return ret;
+        },
         __wbg_get_9b94d73e6221f75c: function(arg0, arg1) {
             const ret = arg0[arg1 >>> 0];
             return ret;
@@ -1020,10 +1046,24 @@ function __wbg_get_imports() {
             const ret = Reflect.get(arg0, arg1);
             return ret;
         }, arguments); },
+        __wbg_get_c60162cf03da5a6e: function(arg0, arg1) {
+            const ret = arg0.get(arg1);
+            return ret;
+        },
         __wbg_instanceof_ArrayBuffer_c367199e2fa2aa04: function(arg0) {
             let result;
             try {
                 result = arg0 instanceof ArrayBuffer;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Map_53af74335dec57f4: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Map;
             } catch (_) {
                 result = false;
             }

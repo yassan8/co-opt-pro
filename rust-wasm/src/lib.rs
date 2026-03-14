@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use js_sys::{Float64Array, Function};
 
 const EPS_R: f64 = 1e-10;
@@ -6411,6 +6412,318 @@ pub fn run_native_magnification_chromatic_aberration_wasm_json(req_json: String)
         "message": "Computed via Rust/WASM direct native-parity LCA path"
     }))
     .map_err(|err| JsValue::from_str(&format!("serialize error: {}", err)))
+}
+
+fn distortion_default_source_rows_wasm(wavelength: f64) -> Vec<Value> {
+    vec![serde_json::json!({
+        "id": "NativeDistortionSource",
+        "name": "NativeDistortionSource",
+        "wavelength": wavelength,
+        "color": "#22c55e",
+        "isPrimary": true,
+        "intensity": 1
+    })]
+}
+
+fn distortion_extract_image_heights_from_lca_js(js: JsValue) -> Result<Vec<Option<f64>>, JsValue> {
+    let top_map: js_sys::Map = js
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("run_native_distortion_wasm_json: expected top-level Map response"))?;
+
+    let data_by_wavelength = top_map.get(&JsValue::from_str("dataByWavelength"));
+    if !js_sys::Array::is_array(&data_by_wavelength) {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: missing dataByWavelength",
+        ));
+    }
+    let data_array = js_sys::Array::from(&data_by_wavelength);
+    let first = data_array.get(0);
+    let first_map: js_sys::Map = first
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("run_native_distortion_wasm_json: expected wavelength entry Map"))?;
+
+    let image_heights = first_map.get(&JsValue::from_str("imageHeights"));
+    if !js_sys::Array::is_array(&image_heights) {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: missing imageHeights",
+        ));
+    }
+    let image_heights_array = js_sys::Array::from(&image_heights);
+    let mut out = Vec::with_capacity(image_heights_array.length() as usize);
+    for idx in 0..image_heights_array.length() {
+        let value = image_heights_array.get(idx);
+        if value.is_null() || value.is_undefined() {
+            out.push(None);
+        } else if let Some(v) = value.as_f64() {
+            out.push(Some(v));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
+}
+
+fn distortion_compute_image_heights_via_lca_wasm(
+    rows: &[Value],
+    source_rows: &[Value],
+    field_samples: &[f64],
+    wavelength: f64,
+    surface_index: usize,
+    height_mode: bool,
+) -> Result<Vec<Option<f64>>, JsValue> {
+    if field_samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let req = serde_json::json!({
+        "opticalSystemRows": rows,
+        "sourceRows": source_rows,
+        "fieldSamples": field_samples,
+        "heightMode": height_mode,
+        "surfaceIndex": surface_index,
+        "chiefRayDefinition": "stop-center",
+        "referenceWavelength": wavelength,
+        "wavelengths": [wavelength],
+    });
+
+    let req_json = serde_json::to_string(&req)
+        .map_err(|e| JsValue::from_str(&format!("run_native_distortion_wasm_json: request serialize error: {}", e)))?;
+    let js = run_native_magnification_chromatic_aberration_wasm_json(req_json)?;
+    distortion_extract_image_heights_from_lca_js(js)
+}
+
+#[wasm_bindgen]
+pub fn run_native_distortion_wasm_json(req_json: String) -> Result<JsValue, JsValue> {
+    use std::f64::consts::PI;
+
+    let req: Value = serde_json::from_str(&req_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid request json: {}", e)))?;
+    let req_obj = req
+        .as_object()
+        .ok_or_else(|| JsValue::from_str("request must be an object"))?;
+
+    let rows_raw = req_obj
+        .get("opticalSystemRows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| JsValue::from_str("opticalSystemRows is required"))?;
+    if rows_raw.is_empty() {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: opticalSystemRows is empty",
+        ));
+    }
+    let rows: Vec<Value> = rows_raw.iter().map(normalize_coord_trans_row).collect();
+
+    let field_values: Vec<f64> = req_obj
+        .get("fieldSamples")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(value_to_f64)
+        .filter(|v| v.is_finite())
+        .collect();
+    if field_values.is_empty() {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: fieldSamples is empty",
+        ));
+    }
+
+    let surface_index = req_obj
+        .get("surfaceIndex")
+        .and_then(value_to_f64)
+        .map(|v| v.max(0.0) as usize)
+        .unwrap_or_else(|| lca_find_image_surface_index_wasm(&rows))
+        .min(rows.len().saturating_sub(1));
+
+    let height_mode = req_obj
+        .get("heightMode")
+        .and_then(|v| match v {
+            Value::Bool(b) => Some(*b),
+            Value::Number(n) => n.as_i64().map(|x| x != 0),
+            Value::String(s) => {
+                let t = s.trim().to_ascii_lowercase();
+                if t == "true" || t == "1" || t == "yes" {
+                    Some(true)
+                } else if t == "false" || t == "0" || t == "no" {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+
+    let source_rows_input: Vec<Value> = req_obj
+        .get("sourceRows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let wavelength = req_obj
+        .get("wavelength")
+        .and_then(value_to_f64)
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .unwrap_or_else(|| {
+            source_rows_input
+                .iter()
+                .filter_map(|row| {
+                    row.as_object()
+                        .and_then(|obj| obj.get("wavelength").or_else(|| obj.get("Wavelength")))
+                        .and_then(value_to_f64)
+                        .filter(|w| w.is_finite() && *w > 0.0)
+                })
+                .next()
+                .unwrap_or(0.5876)
+        });
+
+    let source_rows = if source_rows_input.is_empty() {
+        distortion_default_source_rows_wasm(wavelength)
+    } else {
+        source_rows_input
+    };
+
+    let finite_system = !is_infinite_conjugate_native(&rows);
+    let mirror_sign = lca_mirror_sign_wasm(&rows);
+    let object_distance = rows
+        .first()
+        .and_then(|row| {
+            get_field(row, "thickness")
+                .or_else(|| get_field(row, "distance"))
+                .and_then(value_to_f64)
+        })
+        .unwrap_or(0.0);
+
+    let focal_probe = [0.1_f64];
+    let focal_probe_heights = distortion_compute_image_heights_via_lca_wasm(
+        &rows,
+        &source_rows,
+        &focal_probe,
+        wavelength,
+        surface_index,
+        false,
+    )?;
+    let probe_height = focal_probe_heights
+        .first()
+        .and_then(|v| *v)
+        .ok_or_else(|| {
+            JsValue::from_str("run_native_distortion_wasm_json: failed to estimate focal length")
+        })?;
+    let theta_rad = focal_probe[0] * PI / 180.0;
+    let focal_length = probe_height / theta_rad.tan();
+    if !focal_length.is_finite() || focal_length.abs() <= 1e-9 {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: invalid focal length",
+        ));
+    }
+
+    let magnification = if height_mode && finite_system {
+        let mag_probe = [1.0_f64];
+        let mag_probe_heights = distortion_compute_image_heights_via_lca_wasm(
+            &rows,
+            &source_rows,
+            &mag_probe,
+            wavelength,
+            surface_index,
+            true,
+        )?;
+        mag_probe_heights
+            .first()
+            .and_then(|v| *v)
+            .map(|y| y / 1.0_f64)
+            .unwrap_or(-1.0)
+    } else {
+        -1.0
+    };
+
+    let real_signed_heights = distortion_compute_image_heights_via_lca_wasm(
+        &rows,
+        &source_rows,
+        &field_values,
+        wavelength,
+        surface_index,
+        height_mode,
+    )?;
+    let real_heights: Vec<Option<f64>> = real_signed_heights
+        .iter()
+        .map(|v| v.map(|x| x.abs()))
+        .collect();
+
+    let ideal_heights: Vec<f64> = field_values
+        .iter()
+        .map(|sample| {
+            if height_mode {
+                if finite_system {
+                    magnification * *sample
+                } else {
+                    *sample
+                }
+            } else {
+                focal_length * ((*sample) * PI / 180.0).tan()
+            }
+        })
+        .collect();
+
+    let distortion: Vec<Option<f64>> = ideal_heights
+        .iter()
+        .enumerate()
+        .map(|(idx, h_ideal)| {
+            if h_ideal.abs() < 1e-12 {
+                Some(0.0)
+            } else if let Some(h_real) = real_heights[idx] {
+                Some((h_real - *h_ideal) / *h_ideal)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let distortion_percent: Vec<Option<f64>> = distortion.iter().map(|v| v.map(|x| x * 100.0)).collect();
+
+    let real_heights_json: Vec<Value> = real_heights
+        .iter()
+        .map(|v| match v {
+            Some(x) => Value::from(*x),
+            None => Value::Null,
+        })
+        .collect();
+    let distortion_json: Vec<Value> = distortion
+        .iter()
+        .map(|v| match v {
+            Some(x) => Value::from(*x),
+            None => Value::Null,
+        })
+        .collect();
+    let distortion_percent_json: Vec<Value> = distortion_percent
+        .iter()
+        .map(|v| match v {
+            Some(x) => Value::from(*x),
+            None => Value::Null,
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "backend": "native-rust-distortion-wasm",
+        "fieldValues": field_values,
+        "idealHeights": ideal_heights,
+        "realHeights": real_heights_json,
+        "distortion": distortion_json,
+        "distortionPercent": distortion_percent_json,
+        "meta": {
+            "wavelength": wavelength,
+            "focalLength": focal_length,
+            "finiteSystem": finite_system,
+            "heightMode": height_mode,
+            "magnification": magnification,
+            "mirrorSign": mirror_sign,
+            "surfaceIndex": surface_index,
+            "source": "run_native_distortion_wasm_json"
+        },
+        "message": "Computed via Rust/WASM direct native-parity distortion path"
+    });
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|err| JsValue::from_str(&format!("serialize error: {}", err)))?;
+    Ok(JsValue::from_str(&response_json))
 }
 
 #[wasm_bindgen]

@@ -99,6 +99,8 @@ export function reflect_ray_batch(dirs: Float64Array, normals: Float64Array, cou
 
 export function refract_ray_batch(dirs: Float64Array, normals: Float64Array, n1: Float64Array, n2: Float64Array, count: number): Float64Array;
 
+export function run_native_distortion_wasm_json(req_json: string): any;
+
 export function run_native_magnification_chromatic_aberration_wasm_json(req_json: string): any;
 
 export function run_native_opd_map_wasm_json(req_json: string): any;
@@ -213,6 +215,7 @@ export interface InitOutput {
     readonly qr_factorization: (a: number, b: number, c: number, d: number) => [number, number];
     readonly reflect_ray_batch: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly refract_ray_batch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
+    readonly run_native_distortion_wasm_json: (a: number, b: number) => [number, number, number];
     readonly run_native_magnification_chromatic_aberration_wasm_json: (a: number, b: number) => [number, number, number];
     readonly run_native_opd_map_wasm_json: (a: number, b: number) => [number, number, number];
     readonly solve_linear_system: (a: number, b: number, c: number, d: number, e: number) => [number, number];
