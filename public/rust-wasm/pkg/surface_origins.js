@@ -278,6 +278,18 @@ export function generate_centered_grid_offsets_flat(ray_count, half_extent) {
 }
 
 /**
+ * @param {number} ray_count
+ * @param {number} max_radius
+ * @returns {Float64Array}
+ */
+export function generate_cross_offsets_flat(ray_count, max_radius) {
+    const ret = wasm.generate_cross_offsets_flat(ray_count, max_radius);
+    var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+    return v1;
+}
+
+/**
  * @param {Float64Array} x
  * @param {Float64Array} steps
  * @param {number} n
@@ -504,6 +516,20 @@ export function refract_ray_batch(dirs, normals, n1, n2, count) {
     var v5 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
     return v5;
+}
+
+/**
+ * @param {string} req_json
+ * @returns {any}
+ */
+export function run_native_magnification_chromatic_aberration_wasm_json(req_json) {
+    const ptr0 = passStringToWasm0(req_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.run_native_magnification_chromatic_aberration_wasm_json(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
 }
 
 /**
