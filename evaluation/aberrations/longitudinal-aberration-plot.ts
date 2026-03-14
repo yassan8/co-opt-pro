@@ -9,13 +9,56 @@
 
 declare const Plotly: any;
 
+const PLOTLY_CDN_URL = 'https://cdn.plot.ly/plotly-2.32.0.min.js';
+
+function getPlotlyFromWindow(candidate: any): any {
+    if (candidate && candidate.Plotly && typeof candidate.Plotly.newPlot === 'function') {
+        return candidate.Plotly;
+    }
+    return null;
+}
+
+async function ensurePlotlyForDocument(doc: any, fallbackWindow: any): Promise<any> {
+    const direct = getPlotlyFromWindow(doc?.defaultView)
+        || getPlotlyFromWindow(fallbackWindow)
+        || (typeof window !== 'undefined' ? getPlotlyFromWindow(window) : null)
+        || (typeof Plotly !== 'undefined' && Plotly && typeof (Plotly as any).newPlot === 'function' ? Plotly : null);
+    if (direct) return direct;
+
+    if (!doc || typeof doc.querySelector !== 'function' || !doc.createElement) {
+        return null;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+        const existing = doc.querySelector('script[data-coopt-plotly="1"]') as HTMLScriptElement | null;
+        if (existing) {
+            existing.addEventListener('load', () => resolve(), { once: true });
+            existing.addEventListener('error', () => reject(new Error('Failed to load Plotly')), { once: true });
+            return;
+        }
+
+        const script = doc.createElement('script');
+        script.src = PLOTLY_CDN_URL;
+        script.async = true;
+        script.setAttribute('data-coopt-plotly', '1');
+        script.addEventListener('load', () => resolve(), { once: true });
+        script.addEventListener('error', () => reject(new Error('Failed to load Plotly')), { once: true });
+        (doc.head || doc.documentElement || doc.body).appendChild(script);
+    });
+
+    return getPlotlyFromWindow(doc?.defaultView)
+        || getPlotlyFromWindow(fallbackWindow)
+        || (typeof window !== 'undefined' ? getPlotlyFromWindow(window) : null)
+        || (typeof Plotly !== 'undefined' && Plotly && typeof (Plotly as any).newPlot === 'function' ? Plotly : null);
+}
+
 /**
  * 球面収差図をプロット
  * @param {string} containerId - 表示先コンテナID
  * @param {Object} aberrationData - 縦収差データ
  * @param {Object} options - プロットオプション
  */
-export function plotLongitudinalAberration(containerId: string, aberrationData: any, options: any = {}) {
+export async function plotLongitudinalAberration(containerId: string, aberrationData: any, options: any = {}) {
     const {
         title = 'Spherical Aberration Diagram',
         width = 800,
@@ -26,9 +69,9 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
     
     console.log('📈 球面収差図プロット開始');
     
-    if (!aberrationData || !aberrationData.meridionalData) {
+    if (!aberrationData || !Array.isArray(aberrationData.meridionalData)) {
         console.error('❌ 縦収差データが不正です');
-        return;
+        throw new Error('Invalid spherical aberration data: meridionalData is required');
     }
     
     const container = typeof containerId === 'string'
@@ -36,18 +79,43 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
         : containerId;
     if (!container) {
         console.error(`❌ コンテナが見つかりません: ${containerId}`);
-        return;
+        throw new Error(`Spherical aberration container not found: ${String(containerId)}`);
     }
 
     const doc = container.ownerDocument || document;
-    const plotly = doc.defaultView?.Plotly || (typeof window !== 'undefined' ? window.Plotly : null);
+    const plotly = await ensurePlotlyForDocument(doc, typeof window !== 'undefined' ? window : null);
     if (!plotly || typeof plotly.newPlot !== 'function') {
         console.error('❌ Plotly is not available. Please ensure the library is loaded.');
-        return;
+        throw new Error('Plotly is not available for spherical aberration plotting');
     }
     
+    const meridionalSeries = Array.isArray(aberrationData.meridionalData) ? aberrationData.meridionalData : [];
+    const sagittalSeries = Array.isArray(aberrationData.sagittalData) ? aberrationData.sagittalData : [];
+
     // Plotlyトレースを作成
     const traces = [];
+
+    const toFiniteNumber = (v: unknown): number | null => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    };
+
+    const getSortedFinitePoints = (series: any): Array<{ pupilCoordinate: number; longitudinalAberration: number; sineConditionViolation?: number | null }> => {
+        const points = Array.isArray(series?.points) ? series.points : [];
+        const normalized = points
+            .map((p: any) => {
+                const pupilCoordinate = toFiniteNumber(p?.pupilCoordinate);
+                const longitudinalAberration = toFiniteNumber(p?.longitudinalAberration);
+                const scRaw = p?.sineConditionViolation;
+                const sineConditionViolation = scRaw == null ? null : toFiniteNumber(scRaw);
+                if (pupilCoordinate === null || longitudinalAberration === null) return null;
+                return { pupilCoordinate, longitudinalAberration, sineConditionViolation };
+            })
+            .filter((p: any) => p !== null);
+
+        normalized.sort((a, b) => a.pupilCoordinate - b.pupilCoordinate);
+        return normalized;
+    };
     
     // 波長に応じた色を取得する関数
     // 可視光スペクトルに基づいた色分け
@@ -72,14 +140,15 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
     };
     
     // メリジオナル光線のトレース（実線）
-    aberrationData.meridionalData.forEach((data, index) => {
+    meridionalSeries.forEach((data) => {
         const wavelength = data.wavelength;
         const wavelengthNm = (wavelength * 1000).toFixed(1);  // μmをnmに変換
         const color = getColorForWavelength(wavelength);
         const legendGroup = `wl-${wavelengthNm}`;
         
         // 瞳座標でソート（Y軸の値が単調増加するように）
-        const sortedPoints = [...data.points].sort((a, b) => a.pupilCoordinate - b.pupilCoordinate);
+        const sortedPoints = getSortedFinitePoints(data);
+        if (sortedPoints.length === 0) return;
         
         // X軸とY軸を入れ替え：X軸=縦収差、Y軸=瞳座標
         const xValues = sortedPoints.map(p => p.longitudinalAberration);
@@ -102,14 +171,15 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
     });
     
     // サジタル光線のトレース（破線）
-    aberrationData.sagittalData.forEach((data, index) => {
+    sagittalSeries.forEach((data) => {
         const wavelength = data.wavelength;
         const wavelengthNm = (wavelength * 1000).toFixed(1);  // μmをnmに変換
         const color = getColorForWavelength(wavelength);
         const legendGroup = `wl-${wavelengthNm}`;
         
         // 瞳座標でソート（Y軸の値が単調増加するように）
-        const sortedPoints = [...data.points].sort((a, b) => a.pupilCoordinate - b.pupilCoordinate);
+        const sortedPoints = getSortedFinitePoints(data);
+        if (sortedPoints.length === 0) return;
         
         // X軸とY軸を入れ替え：X軸=縦収差、Y軸=瞳座標
         const xValues = sortedPoints.map(p => p.longitudinalAberration);
@@ -165,21 +235,22 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
     
     // 正弦条件違反量（SC）のトレースを追加
     if (showSC) {
-        aberrationData.meridionalData.forEach((data, index) => {
+        meridionalSeries.forEach((data) => {
             const wavelength = data.wavelength;
             const displayName = `λ=${wavelength.toFixed(4)} μm`;
             const color = getColorForWavelength(wavelength);
             
             // SC値があるデータポイントのみ抽出（null と undefined を除外）
-            const pointsWithSC = data.points.filter(p => p.sineConditionViolation != null);
+            const pointsWithSC = getSortedFinitePoints(data).filter(p => p.sineConditionViolation != null);
             
             if (pointsWithSC.length > 0) {
-                // 瞳座標でソート
-                const sortedPoints = [...pointsWithSC].sort((a, b) => a.pupilCoordinate - b.pupilCoordinate);
-                
                 // X軸=SC値（パーセント表示）、Y軸=瞳座標
-                const xValues = sortedPoints.map(p => p.sineConditionViolation * 100);  // パーセント表示
-                const yValues = sortedPoints.map(p => p.pupilCoordinate);
+                const xValues = pointsWithSC
+                    .map(p => Number(p.sineConditionViolation) * 100)
+                    .filter(v => Number.isFinite(v)); // パーセント表示
+                const yValues = pointsWithSC.map(p => p.pupilCoordinate);
+
+                if (xValues.length === 0 || yValues.length === 0 || xValues.length !== yValues.length) return;
                 
                 traces.push({
                     x: xValues,
@@ -199,6 +270,12 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
             }
         });
     }
+
+    if (traces.length === 0) {
+        container.innerHTML = '<div style="padding:20px;color:#666;font-family:Arial;">No valid spherical aberration samples were produced for plotting.</div>';
+        console.warn('⚠️ No valid spherical aberration points to plot.');
+        return;
+    }
     
     // X軸の範囲を計算（0に対して対称）
     let allXValues = [];
@@ -216,11 +293,13 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
     
     // 横軸範囲: 通常は±0.5mm（非点収差図と揃える）。
     // ただし値が大きい場合は自動で拡張し、プロットが空に見えるのを避ける。
-    const maxAbsLong = allXValues.length > 0 ? Math.max(...allXValues.map(x => Math.abs(x))) : 0.5;
+    const finiteLongValues = allXValues.filter(x => Number.isFinite(Number(x))).map(x => Math.abs(Number(x)));
+    const maxAbsLong = finiteLongValues.length > 0 ? Math.max(...finiteLongValues) : 0.5;
     const symmetricRange = Math.max(0.5, (Number.isFinite(maxAbsLong) && maxAbsLong > 0) ? maxAbsLong * 1.1 : 0.5);
     
-    const maxAbsSC = allSCValues.length > 0 ? Math.max(...allSCValues.map(x => Math.abs(x))) : 1;
-    const symmetricRangeSC = maxAbsSC * 1.1; // 10%のマージンを追加
+    const finiteSCValues = allSCValues.filter(x => Number.isFinite(Number(x))).map(x => Math.abs(Number(x)));
+    const maxAbsSC = finiteSCValues.length > 0 ? Math.max(...finiteSCValues) : 1;
+    const symmetricRangeSC = Number.isFinite(maxAbsSC) && maxAbsSC > 0 ? maxAbsSC * 1.1 : 1; // 10%のマージンを追加
     
     // レイアウト設定
     const layout = {
@@ -300,12 +379,18 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
     }
     
     // プロット実行
-    plotly.newPlot(container, traces, layout, {
-        responsive: !!fitToContainer,
-        displayModeBar: true,
-        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
-        displaylogo: false
-    });
+    try {
+        plotly.newPlot(container, traces, layout, {
+            responsive: !!fitToContainer,
+            displayModeBar: true,
+            modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+            displaylogo: false
+        });
+    } catch (err) {
+        console.error('❌ Plotly spherical aberration rendering failed:', err);
+        container.innerHTML = '<div style="padding:20px;color:red;font-family:Arial;">Failed to render spherical aberration diagram.</div>';
+        return;
+    }
 
     if (fitToContainer && plotly.Plots && typeof plotly.Plots.resize === 'function') {
         const win = doc.defaultView || window;
@@ -327,8 +412,8 @@ export function plotLongitudinalAberration(containerId: string, aberrationData: 
  */
 export function plotLongitudinalAberrationDiagram(aberrationData, containerId = 'longitudinal-aberration-container') {
     console.log('🔄 球面収差図表示（Plotly版）');
-    
-    plotLongitudinalAberration(containerId, aberrationData, {
+
+    return plotLongitudinalAberration(containerId, aberrationData, {
         title: 'Spherical Aberration Diagram',
         showSC: false,  // 軸上光線ではSCは物理的に意味がないため非表示
         fitToContainer: true
