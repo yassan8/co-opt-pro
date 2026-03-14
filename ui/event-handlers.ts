@@ -26,7 +26,7 @@ import { calculateFocalLength, calculateParaxialData, findStopSurfaceIndex, calc
 import { DEFAULT_STOP_SEMI_DIAMETER } from '../data/block-schema.ts';
 import { loadSystemConfigurations } from '../data/table-configuration.ts';
 import { requestUpdateSurfaceNumberSelect } from '../core/window-facade.ts';
-import { runAnalysisCompute, runNativeDistortion, runNativeFieldMtfMap, runNativeGridDistortion, runNativeMtfMap, runNativeOpdMap, runNativePsfMap, runNativeSphericalAberration, runNativeSpotRaytrace, runNativeThroughFocusMtfMap } from '../src/desktop/ipc/client.ts';
+import { runAnalysisCompute, runNativeDistortion, runNativeFieldMtfMap, runNativeGridDistortion, runNativeMagnificationChromaticAberration, runNativeMtfMap, runNativeOpdMap, runNativePsfMap, runNativeSphericalAberration, runNativeSpotRaytrace, runNativeThroughFocusMtfMap } from '../src/desktop/ipc/client.ts';
 import { isTauriRuntime } from '../src/desktop/runtime.ts';
 import { listen } from '@tauri-apps/api/event';
 import { hideAnalysisProgressHud, showAnalysisProgressHud, updateAnalysisProgressHud } from './shared/analysis-progress-hud.ts';
@@ -1227,6 +1227,83 @@ function deriveDistortionFieldValuesForPopup(objectRows: any[]): { fieldValues: 
     if (fieldValues[fieldValues.length - 1] !== maxAngle) fieldValues.push(maxAngle);
     return { fieldValues, heightMode: false };
 }
+
+function deriveLcaFieldValuesForPopup(objectRows: any[], pointCountRaw?: number): { fieldValues: number[]; heightMode: boolean } {
+    const rows = Array.isArray(objectRows) ? objectRows : [];
+    const mode = inferDistortionFieldModeForPopup(rows);
+    const heightMode = mode === 'height';
+    const rawFieldValues = rows
+        .map((o: any) => {
+            if (heightMode) {
+                return parseFloat(o?.yHeight ?? o?.y ?? o?.yHeightAngle ?? Number.NaN);
+            }
+            return parseFloat(o?.yHeightAngle ?? o?.yFieldAngle ?? o?.yAngle ?? o?.fieldAngle ?? o?.y ?? Number.NaN);
+        })
+        .filter((v: number) => Number.isFinite(v))
+        .map((v: number) => Math.abs(v));
+
+    const maxFieldValue = rawFieldValues.length > 0 ? Math.max(...rawFieldValues) : Number.NaN;
+    const pointCount = Number.isFinite(pointCountRaw) ? Math.max(2, Math.min(201, Math.round(Number(pointCountRaw)))) : 21;
+    if (!Number.isFinite(maxFieldValue) || maxFieldValue <= 0) {
+        return { fieldValues: [0, 1], heightMode };
+    }
+
+    const fieldValues: number[] = [];
+    if (pointCount <= 1) {
+        fieldValues.push(maxFieldValue);
+    } else {
+        for (let i = 0; i < pointCount; i++) {
+            const v = (maxFieldValue * i) / (pointCount - 1);
+            fieldValues.push(Number(v.toFixed(6)));
+        }
+    }
+    return { fieldValues, heightMode };
+}
+
+async function runDesktopNativeMagnificationChromaticAberrationForPopup(payload: {
+    pointCount?: number;
+    chiefRayDefinition?: 'stop-center' | 'beam-midpoint' | 'beam-centroid' | string;
+}): Promise<any> {
+    const { opticalSystemRows, sourceRows, objectRows } = collectPopupRowsFromMainWindow();
+    const { fieldValues, heightMode } = deriveLcaFieldValuesForPopup(objectRows || [], payload?.pointCount);
+
+    const normalizeUm = (raw: any): number | null => {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        return n > 10 ? (n / 1000) : n;
+    };
+
+    const wavelengths = (() => {
+        const rows = Array.isArray(sourceRows) ? sourceRows : [];
+        const unique: number[] = [];
+        for (const row of rows) {
+            const wl = normalizeUm(row?.wavelength ?? row?.Wavelength);
+            if (wl === null) continue;
+            if (!unique.some((w) => Math.abs(w - wl) < 1e-4)) unique.push(wl);
+            if (unique.length >= 6) break;
+        }
+        return unique.length > 0 ? unique : [0.4358, 0.5876, 0.6563];
+    })();
+
+    const referenceWavelength = 0.5876;
+    if (!wavelengths.some((w) => Math.abs(w - referenceWavelength) < 1e-4)) {
+        wavelengths.push(referenceWavelength);
+        wavelengths.sort((a, b) => a - b);
+    }
+
+    return (runNativeMagnificationChromaticAberration as any)({
+        opticalSystemRows,
+        sourceRows,
+        fieldSamples: fieldValues,
+        wavelengths,
+        referenceWavelength,
+        heightMode,
+        chiefRayDefinition: payload?.chiefRayDefinition || 'stop-center',
+        __forceNativeInvoke: true,
+    });
+}
+
+w.runDesktopNativeMagnificationChromaticAberrationForPopup = runDesktopNativeMagnificationChromaticAberrationForPopup;
 
 async function runPortableDistortionDataForPopup(payload: {
     wavelengths?: number[];
@@ -8441,9 +8518,46 @@ export function setupAnalysisWindows() {
             const xMax = xMaxEl ? parseFloat(xMaxEl.value) : 0.5;
             const pointCount = pointEl ? parseInt(pointEl.value, 10) : 11;
             const chiefRayDefinition = (chiefRayEl && chiefRayEl.value) ? chiefRayEl.value : 'stop-center';
+            const opener = window.opener;
+            const openerIsTauriRuntime = (() => {
+                try {
+                    return !!(opener && typeof opener.isTauriRuntime === 'function' && opener.isTauriRuntime());
+                } catch (_) {
+                    return false;
+                }
+            })();
+            const shouldUseDesktopRust = (() => {
+                try {
+                    if (typeof window !== 'undefined' && typeof window['shouldUseDesktopRustAnalysis'] === 'function') {
+                        return !!window['shouldUseDesktopRustAnalysis']();
+                    }
+                    if (opener && typeof opener.shouldUseDesktopRustAnalysis === 'function') {
+                        return !!opener.shouldUseDesktopRustAnalysis();
+                    }
+                    return false;
+                } catch (_) {
+                    return false;
+                }
+            })();
+            const hasNativeRunner = !!(
+                opener
+                && typeof opener.runDesktopNativeMagnificationChromaticAberrationForPopup === 'function'
+            );
+            const canUseDesktopRust = shouldUseDesktopRust && hasNativeRunner;
 
             try {
-                if (!window.opener || typeof window.opener.showMagnificationChromaticAberrationDiagram !== 'function') {
+                console.log('📊 [LCA popup] mode', {
+                    openerIsTauriRuntime,
+                    shouldUseDesktopRust,
+                    canUseDesktopRust,
+                    hasNativeRunner,
+                    pointCount,
+                    chiefRayDefinition,
+                });
+            } catch (_) {}
+
+            try {
+                if (!opener || typeof opener.showMagnificationChromaticAberrationDiagram !== 'function') {
                     throw new Error('showMagnificationChromaticAberrationDiagram is not available on opener');
                 }
                 setProgress(0, 'Starting...');
@@ -8455,14 +8569,46 @@ export function setupAnalysisWindows() {
                         else setProgress(undefined, msg);
                     } catch (_) {}
                 };
-                await window.opener.showMagnificationChromaticAberrationDiagram({
-                    containerElement: containerEl,
-                    xMin,
-                    xMax,
-                    pointCount,
-                    chiefRayDefinition,
-                    onProgress
-                });
+
+                if (canUseDesktopRust) {
+                    try {
+                        setProgress(25, 'Computing lateral chromatic aberration (Rust)...');
+                        const rustResult = await opener.runDesktopNativeMagnificationChromaticAberrationForPopup({
+                            pointCount,
+                            chiefRayDefinition,
+                        });
+                        setProgress(80, 'Rendering...');
+                        await opener.showMagnificationChromaticAberrationDiagram({
+                            containerElement: containerEl,
+                            xMin,
+                            xMax,
+                            pointCount,
+                            chiefRayDefinition,
+                            onProgress,
+                            precomputedAberrationData: rustResult,
+                        });
+                    } catch (nativeErr) {
+                        console.warn('⚠️ LCA popup Rust path failed; retrying Web fallback.', nativeErr);
+                        setProgress(45, 'Rust path failed. Retrying with Web...');
+                        await opener.showMagnificationChromaticAberrationDiagram({
+                            containerElement: containerEl,
+                            xMin,
+                            xMax,
+                            pointCount,
+                            chiefRayDefinition,
+                            onProgress
+                        });
+                    }
+                } else {
+                    await opener.showMagnificationChromaticAberrationDiagram({
+                        containerElement: containerEl,
+                        xMin,
+                        xMax,
+                        pointCount,
+                        chiefRayDefinition,
+                        onProgress
+                    });
+                }
                 hideProgress();
             } catch (err) {
                 console.error(err);

@@ -99,6 +99,12 @@ function invokeCommand<TRequest, TResponse>(command: string, payload?: TRequest)
   return invoke<TResponse>(command, envelope);
 }
 
+function hasTauriInvokeBridge(): boolean {
+  if (typeof window === "undefined") return false;
+  const w = window as any;
+  return typeof w?.__TAURI_INTERNALS__?.invoke === "function";
+}
+
 function assertArrayField(value: unknown, fieldName: string, commandName: string): void {
   if (!Array.isArray(value)) {
     throw new Error(`${commandName} requires ${fieldName} to be an array`);
@@ -620,7 +626,10 @@ export async function runNativeSpotRaytrace(
       const traceOptions = {
         useRustWasm: true,
         requireRustWasm: true,
-        allowNonStrict: false,
+        // Match native behavior more closely and avoid sparse chief extraction
+        // in high-field LCA fallback paths.
+        allowNonStrict: true,
+        requireForwardHit: false,
       } as any;
 
       const series = requestSeries.map((entry: any, idx: number) => {
@@ -662,6 +671,8 @@ export async function runNativeSpotRaytrace(
         return {
           label: String(entry?.label || `Series ${idx + 1}`),
           color: String(entry?.color || toSeriesColor(idx)),
+          objectIndex: idx,
+          objectId: String(entry?.label || `Series ${idx + 1}`),
           wavelengthUm: Number(wl) > 0 ? Number(wl) : undefined,
           points,
           chiefPointUm,
@@ -742,7 +753,9 @@ export async function runNativeSpotRaytrace(
           traceOptions: {
             useRustWasm: true,
             requireRustWasm: true,
-            allowNonStrict: false,
+            // Keep Web spot-raytrace robust for high-field fallback reconstruction.
+            allowNonStrict: true,
+            requireForwardHit: false,
           },
         },
       );
@@ -758,15 +771,21 @@ export async function runNativeSpotRaytrace(
       const points = pointsRaw
         .map((p: any) => ({ xUm: Number(p?.x) * 1000, yUm: Number(p?.y) * 1000 }))
         .filter((p: any) => Number.isFinite(p.xUm) && Number.isFinite(p.yUm));
-      const chiefSrc = pointsRaw.find((p: any) => p?.isChiefRay === true) || pointsRaw[0];
+      const chiefSrc = (() => {
+        // Match native spot-raytrace semantics: use explicit chief if present;
+        // otherwise leave chief undefined and let downstream interpolation handle gaps.
+        return pointsRaw.find((p: any) => p?.isChiefRay === true) || null;
+      })();
       const chiefPointUm = chiefSrc
-        ? { xUm: Number(chiefSrc?.x) * 1000, yUm: Number(chiefSrc?.y) * 1000 }
+        ? { xUm: Number(chiefSrc.x) * 1000, yUm: Number(chiefSrc.y) * 1000 }
         : undefined;
       const wl = Number(pointsRaw.find((p: any) => Number(p?.wavelength) > 0)?.wavelength);
 
       return {
         label: String(obj?.objectId || obj?.objectType || `Object ${idx + 1}`),
         color: toSeriesColor(idx),
+        objectIndex: Number.isInteger(Number(obj?.objectIndex)) ? Number(obj.objectIndex) : idx,
+        objectId: String(obj?.objectId || `Object-${idx + 1}`),
         wavelengthUm: Number.isFinite(wl) && wl > 0 ? wl : undefined,
         points,
         chiefPointUm: chiefPointUm && Number.isFinite(chiefPointUm.xUm) && Number.isFinite(chiefPointUm.yUm)
@@ -1863,7 +1882,6 @@ export async function runNativeDistortion(
       throw new Error("runNativeDistortion(web): fieldSamples is empty");
     }
 
-    const { calculateParaxialData } = await import("../../../raytracing/core/ray-paraxial.ts");
     const surfaceIndex = Number.isInteger(payload?.surfaceIndex)
       ? Math.max(0, Number(payload.surfaceIndex))
       : pickImageSurfaceIndexNativeLike(opticalSystemRows);
@@ -1874,6 +1892,54 @@ export async function runNativeDistortion(
     const sourceRows = Array.isArray(payload?.sourceRows) && payload.sourceRows.length > 0
       ? payload.sourceRows
       : buildDefaultDistortionSourceRows(wavelength);
+
+    try {
+      const { preloadRustRayTracingWasm } = await import("../../../rust-wasm/ts/raytracing/rust-raytracing-wasm.ts");
+      const wasmApi = await preloadRustRayTracingWasm();
+      if (wasmApi && typeof wasmApi.run_native_distortion_wasm_json === "function") {
+        const wasmReq = {
+          opticalSystemRows,
+          sourceRows,
+          fieldSamples,
+          surfaceIndex,
+          heightMode,
+          wavelength,
+        };
+        const wasmRaw = wasmApi.run_native_distortion_wasm_json(JSON.stringify(wasmReq));
+        const wasmResp = (typeof wasmRaw === "string") ? JSON.parse(wasmRaw) : wasmRaw;
+        if (wasmResp && typeof wasmResp === "object") {
+          return {
+            backend: String((wasmResp as any).backend || "web-rust-wasm"),
+            fieldValues: Array.isArray((wasmResp as any).fieldValues)
+              ? (wasmResp as any).fieldValues.map((v: any) => Number(v)).filter((v: number) => Number.isFinite(v))
+              : fieldSamples,
+            idealHeights: Array.isArray((wasmResp as any).idealHeights)
+              ? (wasmResp as any).idealHeights.map((v: any) => Number(v))
+              : [],
+            realHeights: Array.isArray((wasmResp as any).realHeights)
+              ? (wasmResp as any).realHeights.map((v: any) => (Number.isFinite(Number(v)) ? Number(v) : null))
+              : [],
+            distortion: Array.isArray((wasmResp as any).distortion)
+              ? (wasmResp as any).distortion.map((v: any) => (Number.isFinite(Number(v)) ? Number(v) : null))
+              : [],
+            distortionPercent: Array.isArray((wasmResp as any).distortionPercent)
+              ? (wasmResp as any).distortionPercent.map((v: any) => (Number.isFinite(Number(v)) ? Number(v) : null))
+              : [],
+            meta: ((wasmResp as any).meta && typeof (wasmResp as any).meta === "object")
+              ? (wasmResp as any).meta
+              : {},
+            message: String((wasmResp as any).message || "Computed via Web Rust/WASM distortion API"),
+          };
+        }
+      }
+    } catch (error) {
+      try {
+        console.warn("[Distortion][IPC] Direct Web Rust/WASM distortion path failed; falling back to spot-raytrace path", error);
+      } catch (_) {}
+      // Fallback to the existing web path below when direct WASM distortion is unavailable.
+    }
+
+    const { calculateParaxialData } = await import("../../../raytracing/core/ray-paraxial.ts");
     const finiteSystem = isFiniteConjugateNativeLike(opticalSystemRows);
     const objectDistance = getObjectDistanceMmNativeLike(opticalSystemRows);
     const paraxial = calculateParaxialData(opticalSystemRows, wavelength);
@@ -2100,7 +2166,7 @@ export async function runNativeGridDistortion(
 export async function runNativeMagnificationChromaticAberration(
   payload: NativeMagnificationChromaticAberrationRequest,
 ): Promise<NativeMagnificationChromaticAberrationResponse> {
-  if (!isTauriRuntime()) {
+  const runWebFallback = async (): Promise<NativeMagnificationChromaticAberrationResponse> => {
     const { calculateMagnificationChromaticAberrationData } = await import(
       "../../../evaluation/aberrations/magnification-chromatic-aberration.ts"
     );
@@ -2120,11 +2186,40 @@ export async function runNativeMagnificationChromaticAberration(
     );
     if (!result) throw new Error("Web LCA calculation failed");
     return result as NativeMagnificationChromaticAberrationResponse;
+  };
+
+  const forceNativeRequested = (payload as any)?.__forceNativeInvoke === true;
+  const forceNativeInvoke = forceNativeRequested;
+  const inTauri = isTauriRuntime() || forceNativeInvoke;
+  if (!inTauri) {
+    try {
+      console.warn("[LCA][IPC] Using Web Rust/WASM fallback path (not Tauri runtime)");
+    } catch (_) {}
+    return runWebFallback();
   }
-  return invokeCommand<NativeMagnificationChromaticAberrationRequest, NativeMagnificationChromaticAberrationResponse>(
-    "run_native_magnification_chromatic_aberration",
-    payload,
-  );
+
+  if (forceNativeRequested && !hasTauriInvokeBridge()) {
+    try {
+      console.warn("[LCA][IPC] Forced native invoke requested but Tauri bridge is missing; using Web Rust/WASM fallback");
+    } catch (_) {}
+    return runWebFallback();
+  }
+
+  try {
+    console.log("[LCA][IPC] Using Tauri native invoke path", { forceNativeRequested, forceNativeInvoke });
+  } catch (_) {}
+  try {
+    return await invokeCommand<NativeMagnificationChromaticAberrationRequest, NativeMagnificationChromaticAberrationResponse>(
+      "run_native_magnification_chromatic_aberration",
+      payload,
+    );
+  } catch (err) {
+    if (!forceNativeInvoke) throw err;
+    try {
+      console.warn("[LCA][IPC] Forced native invoke failed; falling back to Web Rust/WASM", err);
+    } catch (_) {}
+    return runWebFallback();
+  }
 }
 
 export async function readTextFile(payload: ReadTextFileRequest): Promise<ReadTextFileResponse> {

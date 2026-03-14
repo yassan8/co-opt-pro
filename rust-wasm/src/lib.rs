@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use js_sys::{Float64Array, Function};
 
 const EPS_R: f64 = 1e-10;
@@ -2391,6 +2392,128 @@ fn trace_hit_xy_with_packed(
         return None;
     }
     Some([hit[2], hit[3]])
+}
+
+fn search_high_field_origin_for_target_native(
+    initial_origin: [f64; 3],
+    dir_vector: [f64; 3],
+    target_surface_index: usize,
+    target_surface_origin: [f64; 3],
+    packed: &PackedMeta,
+    sampling_radius: f64,
+    n_start: f64,
+) -> Option<[f64; 3]> {
+    let base_dir = normalize3(dir_vector[0], dir_vector[1], dir_vector[2]);
+    if !base_dir[0].is_finite() || !base_dir[1].is_finite() || !base_dir[2].is_finite() {
+        return None;
+    }
+
+    let base_span = sampling_radius.max(0.5);
+    let spans = [1.0_f64, 2.0, 4.0, 8.0, 16.0, 32.0];
+    let grid = [-1.0_f64, -0.5, 0.0, 0.5, 1.0];
+
+    let mut best_origin: Option<[f64; 3]> = None;
+    let mut best_score = f64::INFINITY;
+
+    for span_mul in spans {
+        let span = base_span * span_mul;
+        for gx in grid {
+            for gy in grid {
+                let cand = [
+                    initial_origin[0] + gx * span,
+                    initial_origin[1] + gy * span,
+                    initial_origin[2],
+                ];
+
+                let ray = [cand[0], cand[1], cand[2], base_dir[0], base_dir[1], base_dir[2]];
+                let Some(hit) = trace_hit_xy_with_packed(ray, target_surface_index, n_start, packed) else {
+                    continue;
+                };
+
+                let dx = hit[0] - target_surface_origin[0];
+                let dy = hit[1] - target_surface_origin[1];
+                let score = (dx * dx + dy * dy).sqrt();
+                if score < best_score {
+                    best_score = score;
+                    best_origin = Some(cand);
+                }
+            }
+        }
+        if best_origin.is_some() {
+            break;
+        }
+    }
+
+    best_origin
+}
+
+fn search_high_field_origin_by_bundle_native(
+    initial_origin: [f64; 3],
+    dir_vector: [f64; 3],
+    u_axis: [f64; 3],
+    v_axis: [f64; 3],
+    target_surface_index: usize,
+    packed: &PackedMeta,
+    sampling_radius: f64,
+    n_start: f64,
+) -> Option<([f64; 3], usize)> {
+    let base_dir = normalize3(dir_vector[0], dir_vector[1], dir_vector[2]);
+    if !base_dir[0].is_finite() || !base_dir[1].is_finite() || !base_dir[2].is_finite() {
+        return None;
+    }
+
+    let base_span = sampling_radius.max(0.5);
+    let spans = [1.0_f64, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0];
+    let grid = [-1.0_f64, -0.5, 0.0, 0.5, 1.0];
+    let probe_r = (sampling_radius * 0.2).clamp(0.2, 5.0);
+    let probes = [
+        (0.0_f64, 0.0_f64),
+        (probe_r, 0.0),
+        (-probe_r, 0.0),
+        (0.0, probe_r),
+        (0.0, -probe_r),
+        (0.707 * probe_r, 0.707 * probe_r),
+        (-0.707 * probe_r, 0.707 * probe_r),
+        (0.707 * probe_r, -0.707 * probe_r),
+        (-0.707 * probe_r, -0.707 * probe_r),
+    ];
+
+    let mut best_origin: Option<[f64; 3]> = None;
+    let mut best_hits = 0usize;
+
+    for span_mul in spans {
+        let span = base_span * span_mul;
+        for gx in grid {
+            for gy in grid {
+                let cand = [
+                    initial_origin[0] + gx * span * u_axis[0] + gy * span * v_axis[0],
+                    initial_origin[1] + gx * span * u_axis[1] + gy * span * v_axis[1],
+                    initial_origin[2] + gx * span * u_axis[2] + gy * span * v_axis[2],
+                ];
+
+                let mut hits = 0usize;
+                for (pu, pv) in probes {
+                    let sx = cand[0] + pu * u_axis[0] + pv * v_axis[0];
+                    let sy = cand[1] + pu * u_axis[1] + pv * v_axis[1];
+                    let sz = cand[2] + pu * u_axis[2] + pv * v_axis[2];
+                    let ray = [sx, sy, sz, base_dir[0], base_dir[1], base_dir[2]];
+                    if trace_hit_xy_with_packed(ray, target_surface_index, n_start, packed).is_some() {
+                        hits += 1;
+                    }
+                }
+
+                if hits > best_hits {
+                    best_hits = hits;
+                    best_origin = Some(cand);
+                }
+            }
+        }
+        if best_hits >= 3 {
+            break;
+        }
+    }
+
+    best_origin.map(|o| (o, best_hits))
 }
 
 fn brent_minimize_1d_native<F>(f: F, ax: f64, bx: f64, tol: f64, max_iter: usize) -> f64
@@ -5112,6 +5235,42 @@ pub fn generate_annular_offsets_flat(ray_count: usize, max_radius: f64, ring_cou
 }
 
 #[wasm_bindgen]
+pub fn generate_cross_offsets_flat(ray_count: usize, max_radius: f64) -> Vec<f64> {
+    let mut out = Vec::<f64>::new();
+    if ray_count == 0 {
+        return out;
+    }
+
+    out.push(0.0);
+    out.push(0.0);
+    if ray_count == 1 {
+        return out;
+    }
+
+    let mut remaining = ray_count - 1;
+    let requested_per_arm = ((remaining + 3) / 4).max(1);
+    let arm_steps = requested_per_arm;
+    for i in 0..arm_steps {
+        if remaining == 0 {
+            break;
+        }
+        let t = ((i + 1) as f64) / (arm_steps as f64);
+        let r = max_radius * t;
+        let candidates = [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)];
+        for (x, y) in candidates {
+            if remaining == 0 {
+                break;
+            }
+            out.push(x);
+            out.push(y);
+            remaining -= 1;
+        }
+    }
+
+    out
+}
+
+#[wasm_bindgen]
 pub fn generate_centered_grid_offsets_flat(ray_count: usize, half_extent: f64) -> Vec<f64> {
     let mut out = Vec::<f64>::new();
     if ray_count == 0 {
@@ -5506,6 +5665,1067 @@ fn lca_fill_missing_linear_rust(field_values: &[f64], values: &mut [Option<f64>]
     }
 }
 
+fn lca_find_image_surface_index_wasm(rows: &[Value]) -> usize {
+    for i in (0..rows.len()).rev() {
+        let Some(obj) = rows[i].as_object() else {
+            continue;
+        };
+        let surf_type = obj
+            .get("surfType")
+            .or_else(|| obj.get("type"))
+            .or_else(|| obj.get("surfaceType"))
+            .and_then(value_to_string)
+            .unwrap_or_default()
+            .to_lowercase();
+        if surf_type == "image" {
+            return i;
+        }
+    }
+    rows.len().saturating_sub(1)
+}
+
+fn lca_is_mirror_row_wasm(row: &Value) -> bool {
+    let Some(obj) = row.as_object() else {
+        return false;
+    };
+    let material = obj
+        .get("material")
+        .and_then(value_to_string)
+        .unwrap_or_default()
+        .to_lowercase();
+    let row_type = obj
+        .get("type")
+        .and_then(value_to_string)
+        .unwrap_or_default()
+        .to_lowercase();
+    let block_type = obj
+        .get("_blockType")
+        .or_else(|| obj.get("blockType"))
+        .and_then(value_to_string)
+        .unwrap_or_default()
+        .to_lowercase();
+    let surf_type = obj
+        .get("surfType")
+        .or_else(|| obj.get("surfaceType"))
+        .or_else(|| obj.get("type"))
+        .and_then(value_to_string)
+        .unwrap_or_default()
+        .to_lowercase();
+
+    material == "mirror" || row_type == "mirror" || block_type == "mirror" || surf_type == "mirror"
+}
+
+fn lca_mirror_sign_wasm(rows: &[Value]) -> f64 {
+    let mirror_count = rows.iter().filter(|row| lca_is_mirror_row_wasm(row)).count();
+    if mirror_count % 2 == 1 { -1.0 } else { 1.0 }
+}
+
+fn lca_select_image_height_mm_wasm(
+    points_y_um: &[f64],
+    chief_y_um: Option<f64>,
+    chief_ray_definition: &str,
+    mirror_sign: f64,
+) -> Option<f64> {
+    let mode = chief_ray_definition.to_lowercase();
+    if mode.starts_with("beam-midpoint") {
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for y in points_y_um {
+            if !y.is_finite() {
+                continue;
+            }
+            if *y < min_y {
+                min_y = *y;
+            }
+            if *y > max_y {
+                max_y = *y;
+            }
+        }
+        if !min_y.is_finite() || !max_y.is_finite() {
+            return None;
+        }
+        return Some(((min_y + max_y) * 0.5 / 1000.0) * mirror_sign);
+    }
+
+    if mode.starts_with("beam-centroid") {
+        let mut sum = 0.0_f64;
+        let mut count = 0usize;
+        for y in points_y_um {
+            if y.is_finite() {
+                sum += *y;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        return Some(((sum / count as f64) / 1000.0) * mirror_sign);
+    }
+
+    chief_y_um.map(|y| (y / 1000.0) * mirror_sign)
+}
+
+fn build_packed_meta_lca_wasm(rows: &[Value], wavelength_um: f64) -> Result<(PackedMeta, Vec<f64>, Vec<f64>), JsValue> {
+    let row_count = rows.len();
+    if row_count == 0 {
+        return Err(JsValue::from_str("build_packed_meta_lca_wasm: rows is empty"));
+    }
+
+    let ex = [1.0_f64, 0.0, 0.0];
+    let ey = [0.0_f64, 1.0, 0.0];
+    let ez = [0.0_f64, 0.0, 1.0];
+
+    let mut row_origins = vec![0.0_f64; row_count * 3];
+    let mut row_rots = vec![0.0_f64; row_count * 9];
+    let mut row_inv_rots = vec![0.0_f64; row_count * 9];
+    let mut current_origin = [0.0_f64; 3];
+    let mut current_rot = create_identity_matrix();
+
+    for s in 0..row_count {
+        let surface = &rows[s];
+        let previous = if s > 0 { Some(&rows[s - 1]) } else { None };
+
+        let (surface_origin, surface_rot) = if is_coord_trans_row(surface) {
+            let (dx, dy, dz, tx, ty, tz, order) = parse_coord_trans_params(surface);
+            let mut thickness = previous.map(get_safe_thickness).unwrap_or(0.0);
+            if !thickness.is_finite() { thickness = 0.0; }
+            let prev_rot = current_rot;
+            let single_rot = create_rotation_matrix(tx, ty, tz, order);
+            let new_rot = multiply_matrices(single_rot, current_rot);
+            let o = if order == 0 {
+                let tz_term = vec3_scale(apply_matrix_to_vec3(prev_rot, ez), thickness);
+                let dx_term = vec3_scale(apply_matrix_to_vec3(prev_rot, ex), dx);
+                let dy_term = vec3_scale(apply_matrix_to_vec3(prev_rot, ey), dy);
+                let dz_term = vec3_scale(apply_matrix_to_vec3(prev_rot, ez), dz);
+                vec3_add(vec3_add(vec3_add(vec3_add(current_origin, tz_term), dx_term), dy_term), dz_term)
+            } else {
+                let tz_term = vec3_scale(apply_matrix_to_vec3(prev_rot, ez), thickness);
+                let dx_term = vec3_scale(apply_matrix_to_vec3(new_rot, ex), dx);
+                let dy_term = vec3_scale(apply_matrix_to_vec3(new_rot, ey), dy);
+                let dz_term = vec3_scale(apply_matrix_to_vec3(new_rot, ez), dz);
+                vec3_add(vec3_add(vec3_add(vec3_add(current_origin, tz_term), dx_term), dy_term), dz_term)
+            };
+            (o, new_rot)
+        } else {
+            let mut thickness = previous.map(get_safe_thickness).unwrap_or(0.0);
+            if !thickness.is_finite() { thickness = 0.0; }
+            let tz_term = vec3_scale(apply_matrix_to_vec3(current_rot, ez), thickness);
+            (vec3_add(current_origin, tz_term), current_rot)
+        };
+
+        let o = s * 3;
+        row_origins[o] = surface_origin[0];
+        row_origins[o + 1] = surface_origin[1];
+        row_origins[o + 2] = surface_origin[2];
+
+        let r = s * 9;
+        for rr in 0..3 {
+            for cc in 0..3 {
+                row_rots[r + rr * 3 + cc] = surface_rot[rr][cc];
+                row_inv_rots[r + rr * 3 + cc] = surface_rot[cc][rr];
+            }
+        }
+
+        current_origin = surface_origin;
+        current_rot = surface_rot;
+    }
+
+    let mut row_meta = vec![0_i32; row_count * 4];
+    let mut row_params = vec![0.0_f64; row_count * 24];
+
+    for i in 0..row_count {
+        let row = &rows[i];
+        let m = i * 4;
+        let p = i * 24;
+
+        let kind = get_surface_kind(row);
+        row_meta[m] = kind;
+        row_meta[m + 2] = i as i32;
+        row_meta[m + 3] = 0;
+
+        let material = get_field(row, "material")
+            .and_then(value_to_string)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
+        let is_mirror = material == "MIRROR";
+        let surf_type = get_field(row, "surfType")
+            .or_else(|| get_field(row, "type"))
+            .and_then(value_to_string)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let image_type_raw = get_field(row, "object type")
+            .or_else(|| get_field(row, "object"))
+            .or_else(|| get_field(row, "Object"))
+            .or_else(|| get_field(row, "type"))
+            .and_then(value_to_string)
+            .unwrap_or_default();
+        let image_norm = compact(&image_type_raw);
+        let is_image_surface = image_norm == "image" || image_norm.starts_with("image");
+
+        let is_toric = surf_type.contains("toric");
+        let is_odd = surf_type.contains("odd");
+        let radius = get_field(row, "radius").and_then(value_to_f64).unwrap_or(f64::NAN);
+        let is_plane = !radius.is_finite() || radius.abs() < 1e-12 || surf_type.contains("plane");
+
+        let mut flags = 0_i32;
+        if is_mirror { flags |= 1; }
+        if is_plane { flags |= 2; }
+        if is_toric { flags |= 4; }
+        if is_image_surface { flags |= 8; }
+        if is_odd { flags |= 32; }
+        row_meta[m + 1] = flags;
+
+        row_params[p] = radius;
+        row_params[p + 1] = get_field(row, "conic").and_then(value_to_f64).unwrap_or(0.0);
+        for k in 0..10 {
+            let key = format!("coef{}", k + 1);
+            row_params[p + 2 + k] = get_field(row, &key).and_then(value_to_f64).unwrap_or(0.0);
+        }
+
+        let semidia = match get_field(row, "__cooptActualSemidia").or_else(|| get_field(row, "semidia")) {
+            Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("auto") || s.trim().is_empty() => f64::INFINITY,
+            Some(v) => {
+                let n = value_to_f64(v).unwrap_or(f64::NAN);
+                if n.is_finite() && n > 0.0 { n } else { f64::INFINITY }
+            }
+            None => f64::INFINITY,
+        };
+        row_params[p + 12] = semidia;
+        row_params[p + 13] = get_field(row, "radiusX").and_then(value_to_f64).unwrap_or(f64::NAN);
+        row_params[p + 14] = get_field(row, "radiusY").and_then(value_to_f64).unwrap_or(f64::NAN);
+        row_params[p + 15] = get_field(row, "axis").and_then(value_to_f64).unwrap_or(0.0);
+        row_params[p + 16] = get_safe_thickness(row);
+        let mut ap_lim = get_field(row, "aperture")
+            .and_then(value_to_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v * 0.5)
+            .unwrap_or(f64::INFINITY);
+        if semidia.is_finite() {
+            ap_lim = ap_lim.min(semidia);
+        }
+        row_params[p + 17] = ap_lim;
+        row_params[p + 18] = f64::NAN;
+        row_params[p + 19] = f64::NAN;
+
+        let n2 = if kind == 0 {
+            if is_mirror {
+                0.0
+            } else {
+                let n = get_correct_refractive_index(row, wavelength_um);
+                if n.is_finite() && n > 0.0 { n } else { 0.0 }
+            }
+        } else if kind == 2 {
+            let material = get_field(row, "material").and_then(value_to_string).unwrap_or_default();
+            let n = parse_refractive_index_from_material(&material);
+            if n > 0.0 { n } else { 0.0 }
+        } else if kind == 3 {
+            let material = get_field(row, "__cooptGapMaterial").and_then(value_to_string).unwrap_or_default();
+            let n = parse_refractive_index_from_material(&material);
+            if n > 0.0 { n } else { 0.0 }
+        } else {
+            0.0
+        };
+        row_params[p + 20] = n2;
+    }
+
+    Ok((
+        PackedMeta {
+            row_meta,
+            row_params,
+            row_origins: row_origins.clone(),
+            row_inv_rots: row_inv_rots.clone(),
+            row_rots: row_rots.clone(),
+            row_count,
+        },
+        row_origins,
+        row_inv_rots,
+    ))
+}
+
+#[wasm_bindgen]
+pub fn run_native_magnification_chromatic_aberration_wasm_json(req_json: String) -> Result<JsValue, JsValue> {
+    use std::f64::consts::PI;
+
+    let req: Value = serde_json::from_str(&req_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid request json: {}", e)))?;
+    let req_obj = req.as_object().ok_or_else(|| JsValue::from_str("request must be an object"))?;
+
+    let rows_raw = req_obj
+        .get("opticalSystemRows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| JsValue::from_str("opticalSystemRows is required"))?;
+    if rows_raw.is_empty() {
+        return Err(JsValue::from_str("run_native_magnification_chromatic_aberration_wasm_json: opticalSystemRows is empty"));
+    }
+    let rows: Vec<Value> = rows_raw.iter().map(normalize_coord_trans_row).collect();
+
+    let mut field_values: Vec<f64> = req_obj
+        .get("fieldSamples")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(value_to_f64)
+        .filter(|v| v.is_finite())
+        .collect();
+    field_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    field_values.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    if field_values.is_empty() {
+        return Err(JsValue::from_str("run_native_magnification_chromatic_aberration_wasm_json: fieldSamples is empty"));
+    }
+
+    let source_rows: Vec<Value> = req_obj
+        .get("sourceRows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut wavelengths: Vec<f64> = req_obj
+        .get("wavelengths")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(value_to_f64)
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .collect();
+    if wavelengths.is_empty() {
+        wavelengths = source_rows
+            .iter()
+            .filter_map(|row| {
+                let obj = row.as_object()?;
+                obj.get("wavelength")
+                    .or_else(|| obj.get("Wavelength"))
+                    .and_then(value_to_f64)
+                    .filter(|w| w.is_finite() && *w > 0.0)
+            })
+            .collect();
+    }
+    if wavelengths.is_empty() {
+        wavelengths.push(0.587_561_8_f64);
+    }
+
+    wavelengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let wavelength_eq_tol = 1.0e-4_f64;
+    wavelengths.dedup_by(|a, b| (*a - *b).abs() < wavelength_eq_tol);
+
+    let mut reference_wavelength = req_obj
+        .get("referenceWavelength")
+        .and_then(value_to_f64)
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .unwrap_or(0.5876);
+    if let Some(wl) = wavelengths
+        .iter()
+        .copied()
+        .find(|w| (*w - reference_wavelength).abs() < wavelength_eq_tol)
+    {
+        reference_wavelength = wl;
+    }
+    if !wavelengths
+        .iter()
+        .any(|w| (*w - reference_wavelength).abs() < wavelength_eq_tol)
+    {
+        wavelengths.push(reference_wavelength);
+        wavelengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    let image_surface_index = req_obj
+        .get("surfaceIndex")
+        .and_then(value_to_f64)
+        .map(|v| v.max(0.0) as usize)
+        .unwrap_or_else(|| lca_find_image_surface_index_wasm(&rows))
+        .min(rows.len().saturating_sub(1));
+
+    let height_mode = req_obj
+        .get("heightMode")
+        .and_then(|v| match v {
+            Value::Bool(b) => Some(*b),
+            Value::Number(n) => n.as_i64().map(|x| x != 0),
+            Value::String(s) => {
+                let t = s.trim().to_ascii_lowercase();
+                if t == "true" || t == "1" || t == "yes" { Some(true) }
+                else if t == "false" || t == "0" || t == "no" { Some(false) }
+                else { None }
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+    let chief_ray_definition = req_obj
+        .get("chiefRayDefinition")
+        .and_then(value_to_string)
+        .unwrap_or_else(|| "stop-center".to_string());
+
+    let finite = !is_infinite_conjugate_native(&rows);
+    let object_distance = rows
+        .first()
+        .and_then(|row| {
+            get_field(row, "thickness")
+                .or_else(|| get_field(row, "distance"))
+                .and_then(value_to_f64)
+        })
+        .unwrap_or(0.0);
+
+    let mirror_sign = lca_mirror_sign_wasm(&rows);
+    let stop_surface_index = find_stop_surface_index(&rows).min(rows.len().saturating_sub(1));
+    let stop_radius = estimate_stop_radius_from_row(&rows[stop_surface_index]).max(0.01);
+    let sampling_radius = stop_radius.max(0.01);
+
+    let mut wavelength_heights = Vec::<(f64, Vec<Option<f64>>)>::new();
+
+    for wl in &wavelengths {
+        let (packed, row_origins, row_inv_rots) = build_packed_meta_lca_wasm(&rows, *wl)?;
+
+        let stop_base = stop_surface_index * 3;
+        let stop_center = [
+            row_origins[stop_base],
+            row_origins[stop_base + 1],
+            row_origins[stop_base + 2],
+        ];
+        let stop_rot_base = stop_surface_index * 9;
+        let stop_plane_u = normalize3(
+            packed.row_rots[stop_rot_base],
+            packed.row_rots[stop_rot_base + 3],
+            packed.row_rots[stop_rot_base + 6],
+        );
+        let stop_plane_v = normalize3(
+            packed.row_rots[stop_rot_base + 1],
+            packed.row_rots[stop_rot_base + 4],
+            packed.row_rots[stop_rot_base + 7],
+        );
+
+        let target_base = image_surface_index * 3;
+        let target_origin = [
+            row_origins[target_base],
+            row_origins[target_base + 1],
+            row_origins[target_base + 2],
+        ];
+        let target_inv_base = image_surface_index * 9;
+        let target_inv = [
+            row_inv_rots[target_inv_base],
+            row_inv_rots[target_inv_base + 1],
+            row_inv_rots[target_inv_base + 2],
+            row_inv_rots[target_inv_base + 3],
+            row_inv_rots[target_inv_base + 4],
+            row_inv_rots[target_inv_base + 5],
+            row_inv_rots[target_inv_base + 6],
+            row_inv_rots[target_inv_base + 7],
+            row_inv_rots[target_inv_base + 8],
+        ];
+
+        let object_plane_z = row_origins.get(2).copied().unwrap_or(0.0);
+
+        let mut image_heights = vec![None; field_values.len()];
+        let mut previous_emission_origin_hint: Option<[f64; 3]> = None;
+        for (fi, sample) in field_values.iter().enumerate() {
+            let (mut start_origin, base_dir, basis_u, basis_v) = if !height_mode && !finite {
+                let angle_x = 0.0_f64;
+                let angle_y = *sample;
+                let dir = build_direction_from_field_angles_native(angle_x, angle_y);
+                let obj_map = Map::<String, Value>::new();
+                let inf_z = resolve_infinite_object_z_native(&rows, &obj_map, object_plane_z);
+                let is_on_axis = angle_x.abs() < 1e-10 && angle_y.abs() < 1e-10;
+                let origin_xy = if is_on_axis {
+                    [0.0, 0.0]
+                } else {
+                    [angle_x.to_radians().tan() * 1.0, angle_y.to_radians().tan() * 1.0]
+                };
+                let sag = compute_object_surface_sag_native(&rows, origin_xy[0], origin_xy[1]);
+                let origin = [origin_xy[0], origin_xy[1], inf_z + sag];
+                let (u_axis, v_axis) = build_perpendicular_basis_native(dir);
+                (origin, dir, u_axis, v_axis)
+            } else {
+                let h_obj = if height_mode {
+                    *sample
+                } else {
+                    object_distance * ((*sample) * PI / 180.0).tan()
+                };
+                let origin = [0.0, h_obj, -object_distance.max(1.0e-6)];
+                let dir = normalize3(
+                    stop_center[0] - origin[0],
+                    stop_center[1] - origin[1],
+                    stop_center[2] - origin[2],
+                );
+                (origin, dir, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+            };
+
+            if !height_mode && !finite {
+                // Keep field-to-field launch continuity per wavelength (native object-series behavior).
+                if sample.abs() > 1e-10 {
+                    if let Some(hint) = previous_emission_origin_hint {
+                        if hint[0].is_finite() && hint[1].is_finite() && hint[2].is_finite() {
+                            start_origin = hint;
+                        }
+                    }
+                }
+            }
+
+            let mut field_start_origin = start_origin;
+            if !height_mode && !finite {
+                if sample.abs() > 1e-10 {
+                    let (search_u_axis, search_v_axis) = build_perpendicular_basis_native(base_dir);
+                    if let Some(refined) = search_high_field_origin_for_target_native(
+                        field_start_origin,
+                        base_dir,
+                        image_surface_index,
+                        target_origin,
+                        &packed,
+                        sampling_radius,
+                        1.0,
+                    ) {
+                        field_start_origin = refined;
+                    } else if let Some((bundle_refined, _bundle_hits)) =
+                        search_high_field_origin_by_bundle_native(
+                            field_start_origin,
+                            base_dir,
+                            search_u_axis,
+                            search_v_axis,
+                            image_surface_index,
+                            &packed,
+                            sampling_radius,
+                            1.0,
+                        )
+                    {
+                        field_start_origin = bundle_refined;
+                    }
+                }
+            }
+
+            let mut selected_pupil_scale = 1.0_f64;
+            let mut selected_origin_solve = !height_mode && !finite && sample.abs() > 1e-10;
+            if !height_mode && !finite && sample.abs() > 1e-10 {
+                // Match native high-field behavior: pick launch mode that maximizes target-surface hit count.
+                let pupil_scales = [
+                    1.0_f64, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.085, 0.06, 0.04, 0.03, 0.02,
+                    0.015, 0.01,
+                ];
+                let origin_solve_modes = [true, false];
+                let probe_ray_count = 101usize;
+                let mut best_hits = 0usize;
+
+                for allow_origin_solve in origin_solve_modes {
+                    for scale in pupil_scales {
+                        let candidate_radius =
+                            (sampling_radius * scale).clamp(0.005, sampling_radius.max(0.005));
+                        let candidate_offsets =
+                            generate_cross_offsets_flat(probe_ray_count, candidate_radius);
+                        let pair_count = candidate_offsets.len() / 2;
+                        if pair_count == 0 {
+                            continue;
+                        }
+
+                        let launch_origin = if allow_origin_solve {
+                            solve_ray_origin_to_stop_point_fast_native(
+                                field_start_origin,
+                                base_dir,
+                                stop_center,
+                                stop_surface_index,
+                                &packed,
+                                1.0,
+                            )
+                            .unwrap_or(field_start_origin)
+                        } else {
+                            field_start_origin
+                        };
+
+                        let mut hits = 0usize;
+                        for ri in 0..pair_count {
+                            let ox = candidate_offsets[ri * 2];
+                            let oy = candidate_offsets[ri * 2 + 1];
+                            let start = [
+                                launch_origin[0] + basis_u[0] * ox + basis_v[0] * oy,
+                                launch_origin[1] + basis_u[1] * ox + basis_v[1] * oy,
+                                launch_origin[2] + basis_u[2] * ox + basis_v[2] * oy,
+                            ];
+                            let hit = trace_single_ray_hit_point_with_meta_core(
+                                &[start[0], start[1], start[2], base_dir[0], base_dir[1], base_dir[2]],
+                                image_surface_index,
+                                1.0,
+                                &packed.row_meta,
+                                &packed.row_params,
+                                &packed.row_origins,
+                                &packed.row_inv_rots,
+                                &packed.row_rots,
+                                packed.row_count,
+                            );
+                            if (hit[0] - 1.0).abs() <= f64::EPSILON {
+                                hits += 1;
+                            }
+                        }
+
+                        if hits > best_hits
+                            || (best_hits == 0 && (scale - 1.0).abs() < 1e-12 && allow_origin_solve)
+                        {
+                            best_hits = hits;
+                            selected_pupil_scale = scale;
+                            selected_origin_solve = allow_origin_solve;
+                        }
+                    }
+                }
+            }
+
+            let ray_count = 101usize;
+            let ray_radius =
+                (sampling_radius * selected_pupil_scale).clamp(0.005, sampling_radius.max(0.005));
+            let offsets = generate_cross_offsets_flat(ray_count, ray_radius);
+            let launch_origin = if !height_mode && !finite && selected_origin_solve {
+                solve_ray_origin_to_stop_point_fast_native(
+                    field_start_origin,
+                    base_dir,
+                    stop_center,
+                    stop_surface_index,
+                    &packed,
+                    1.0,
+                )
+                .unwrap_or(field_start_origin)
+            } else {
+                field_start_origin
+            };
+            if !height_mode && !finite {
+                previous_emission_origin_hint = Some(launch_origin);
+            }
+
+            let mut points_y_um = Vec::<f64>::new();
+            let mut chief_y_um: Option<f64> = None;
+
+            let ray_count = offsets.len() / 2;
+            for ri in 0..ray_count {
+                let ox = offsets[ri * 2];
+                let oy = offsets[ri * 2 + 1];
+                let stop_target = [
+                    stop_center[0] + stop_plane_u[0] * ox + stop_plane_v[0] * oy,
+                    stop_center[1] + stop_plane_u[1] * ox + stop_plane_v[1] * oy,
+                    stop_center[2] + stop_plane_u[2] * ox + stop_plane_v[2] * oy,
+                ];
+
+                let (sx, sy, sz, dx, dy, dz) = if !height_mode && !finite {
+                    let start = [
+                        launch_origin[0] + basis_u[0] * ox + basis_v[0] * oy,
+                        launch_origin[1] + basis_u[1] * ox + basis_v[1] * oy,
+                        launch_origin[2] + basis_u[2] * ox + basis_v[2] * oy,
+                    ];
+                    (start[0], start[1], start[2], base_dir[0], base_dir[1], base_dir[2])
+                } else {
+                    let dir = normalize3(
+                        stop_target[0] - start_origin[0],
+                        stop_target[1] - start_origin[1],
+                        stop_target[2] - start_origin[2],
+                    );
+                    (start_origin[0], start_origin[1], start_origin[2], dir[0], dir[1], dir[2])
+                };
+
+                let hit = trace_single_ray_hit_point_with_meta_core(
+                    &[sx, sy, sz, dx, dy, dz],
+                    image_surface_index,
+                    1.0,
+                    &packed.row_meta,
+                    &packed.row_params,
+                    &packed.row_origins,
+                    &packed.row_inv_rots,
+                    &packed.row_rots,
+                    packed.row_count,
+                );
+                if (hit[0] - 1.0).abs() > f64::EPSILON {
+                    continue;
+                }
+
+                let rel = [
+                    hit[2] - target_origin[0],
+                    hit[3] - target_origin[1],
+                    hit[4] - target_origin[2],
+                ];
+                let local = mul_mat3_vec3(&target_inv, rel);
+                if !local[1].is_finite() {
+                    continue;
+                }
+                let y_um = local[1] * 1000.0;
+                points_y_um.push(y_um);
+                if chief_y_um.is_none() && ox.abs() < 1e-12 && oy.abs() < 1e-12 {
+                    chief_y_um = Some(y_um);
+                }
+            }
+
+            image_heights[fi] = lca_select_image_height_mm_wasm(
+                &points_y_um,
+                chief_y_um,
+                &chief_ray_definition,
+                mirror_sign,
+            );
+        }
+
+        wavelength_heights.push((*wl, image_heights));
+    }
+
+    let reference_heights = wavelength_heights
+        .iter()
+        .find(|(wl, _)| (*wl - reference_wavelength).abs() < wavelength_eq_tol)
+        .map(|(_, h)| h.clone())
+        .ok_or_else(|| JsValue::from_str("run_native_magnification_chromatic_aberration_wasm_json: failed to compute reference wavelength"))?;
+
+    let mut data_by_wavelength = Vec::<Value>::new();
+    for (wl, image_heights) in wavelength_heights {
+        let mut displacements = vec![None; field_values.len()];
+        for i in 0..field_values.len() {
+            displacements[i] = match (image_heights[i], reference_heights[i]) {
+                (Some(h), Some(r)) if h.is_finite() && r.is_finite() => Some(h - r),
+                _ => None,
+            };
+        }
+        lca_fill_missing_linear_rust(&field_values, &mut displacements);
+
+        let image_heights_json: Vec<Value> = image_heights
+            .iter()
+            .map(|v| match v {
+                Some(x) => Value::from(*x),
+                None => Value::Null,
+            })
+            .collect();
+        let displacements_json: Vec<Value> = displacements
+            .iter()
+            .map(|v| match v {
+                Some(x) => Value::from(*x),
+                None => Value::Null,
+            })
+            .collect();
+
+        data_by_wavelength.push(serde_json::json!({
+            "wavelength": wl,
+            "imageHeights": image_heights_json,
+            "displacements": displacements_json,
+        }));
+    }
+
+    serde_wasm_bindgen::to_value(&serde_json::json!({
+        "backend": "native-rust-lateral-chromatic-aberration-wasm",
+        "fieldValues": field_values,
+        "heightMode": height_mode,
+        "referenceWavelength": reference_wavelength,
+        "imageSurfaceIndex": image_surface_index,
+        "dataByWavelength": data_by_wavelength,
+        "meta": {
+            "finiteSystem": finite,
+            "chiefRayDefinition": chief_ray_definition,
+            "mirrorSign": mirror_sign,
+            "source": "run_native_magnification_chromatic_aberration_wasm_json"
+        },
+        "message": "Computed via Rust/WASM direct native-parity LCA path"
+    }))
+    .map_err(|err| JsValue::from_str(&format!("serialize error: {}", err)))
+}
+
+fn distortion_default_source_rows_wasm(wavelength: f64) -> Vec<Value> {
+    vec![serde_json::json!({
+        "id": "NativeDistortionSource",
+        "name": "NativeDistortionSource",
+        "wavelength": wavelength,
+        "color": "#22c55e",
+        "isPrimary": true,
+        "intensity": 1
+    })]
+}
+
+fn distortion_extract_image_heights_from_lca_js(js: JsValue) -> Result<Vec<Option<f64>>, JsValue> {
+    let top_map: js_sys::Map = js
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("run_native_distortion_wasm_json: expected top-level Map response"))?;
+
+    let data_by_wavelength = top_map.get(&JsValue::from_str("dataByWavelength"));
+    if !js_sys::Array::is_array(&data_by_wavelength) {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: missing dataByWavelength",
+        ));
+    }
+    let data_array = js_sys::Array::from(&data_by_wavelength);
+    let first = data_array.get(0);
+    let first_map: js_sys::Map = first
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("run_native_distortion_wasm_json: expected wavelength entry Map"))?;
+
+    let image_heights = first_map.get(&JsValue::from_str("imageHeights"));
+    if !js_sys::Array::is_array(&image_heights) {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: missing imageHeights",
+        ));
+    }
+    let image_heights_array = js_sys::Array::from(&image_heights);
+    let mut out = Vec::with_capacity(image_heights_array.length() as usize);
+    for idx in 0..image_heights_array.length() {
+        let value = image_heights_array.get(idx);
+        if value.is_null() || value.is_undefined() {
+            out.push(None);
+        } else if let Some(v) = value.as_f64() {
+            out.push(Some(v));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
+}
+
+fn distortion_compute_image_heights_via_lca_wasm(
+    rows: &[Value],
+    source_rows: &[Value],
+    field_samples: &[f64],
+    wavelength: f64,
+    surface_index: usize,
+    height_mode: bool,
+) -> Result<Vec<Option<f64>>, JsValue> {
+    if field_samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let req = serde_json::json!({
+        "opticalSystemRows": rows,
+        "sourceRows": source_rows,
+        "fieldSamples": field_samples,
+        "heightMode": height_mode,
+        "surfaceIndex": surface_index,
+        "chiefRayDefinition": "stop-center",
+        "referenceWavelength": wavelength,
+        "wavelengths": [wavelength],
+    });
+
+    let req_json = serde_json::to_string(&req)
+        .map_err(|e| JsValue::from_str(&format!("run_native_distortion_wasm_json: request serialize error: {}", e)))?;
+    let js = run_native_magnification_chromatic_aberration_wasm_json(req_json)?;
+    distortion_extract_image_heights_from_lca_js(js)
+}
+
+#[wasm_bindgen]
+pub fn run_native_distortion_wasm_json(req_json: String) -> Result<JsValue, JsValue> {
+    use std::f64::consts::PI;
+
+    let req: Value = serde_json::from_str(&req_json)
+        .map_err(|e| JsValue::from_str(&format!("invalid request json: {}", e)))?;
+    let req_obj = req
+        .as_object()
+        .ok_or_else(|| JsValue::from_str("request must be an object"))?;
+
+    let rows_raw = req_obj
+        .get("opticalSystemRows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| JsValue::from_str("opticalSystemRows is required"))?;
+    if rows_raw.is_empty() {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: opticalSystemRows is empty",
+        ));
+    }
+    let rows: Vec<Value> = rows_raw.iter().map(normalize_coord_trans_row).collect();
+
+    let field_values: Vec<f64> = req_obj
+        .get("fieldSamples")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(value_to_f64)
+        .filter(|v| v.is_finite())
+        .collect();
+    if field_values.is_empty() {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: fieldSamples is empty",
+        ));
+    }
+
+    let surface_index = req_obj
+        .get("surfaceIndex")
+        .and_then(value_to_f64)
+        .map(|v| v.max(0.0) as usize)
+        .unwrap_or_else(|| lca_find_image_surface_index_wasm(&rows))
+        .min(rows.len().saturating_sub(1));
+
+    let height_mode = req_obj
+        .get("heightMode")
+        .and_then(|v| match v {
+            Value::Bool(b) => Some(*b),
+            Value::Number(n) => n.as_i64().map(|x| x != 0),
+            Value::String(s) => {
+                let t = s.trim().to_ascii_lowercase();
+                if t == "true" || t == "1" || t == "yes" {
+                    Some(true)
+                } else if t == "false" || t == "0" || t == "no" {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+
+    let source_rows_input: Vec<Value> = req_obj
+        .get("sourceRows")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let wavelength = req_obj
+        .get("wavelength")
+        .and_then(value_to_f64)
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .unwrap_or_else(|| {
+            source_rows_input
+                .iter()
+                .filter_map(|row| {
+                    row.as_object()
+                        .and_then(|obj| obj.get("wavelength").or_else(|| obj.get("Wavelength")))
+                        .and_then(value_to_f64)
+                        .filter(|w| w.is_finite() && *w > 0.0)
+                })
+                .next()
+                .unwrap_or(0.5876)
+        });
+
+    let source_rows = if source_rows_input.is_empty() {
+        distortion_default_source_rows_wasm(wavelength)
+    } else {
+        source_rows_input
+    };
+
+    let finite_system = !is_infinite_conjugate_native(&rows);
+    let mirror_sign = lca_mirror_sign_wasm(&rows);
+    let object_distance = rows
+        .first()
+        .and_then(|row| {
+            get_field(row, "thickness")
+                .or_else(|| get_field(row, "distance"))
+                .and_then(value_to_f64)
+        })
+        .unwrap_or(0.0);
+
+    let focal_probe = [0.1_f64];
+    let focal_probe_heights = distortion_compute_image_heights_via_lca_wasm(
+        &rows,
+        &source_rows,
+        &focal_probe,
+        wavelength,
+        surface_index,
+        false,
+    )?;
+    let probe_height = focal_probe_heights
+        .first()
+        .and_then(|v| *v)
+        .ok_or_else(|| {
+            JsValue::from_str("run_native_distortion_wasm_json: failed to estimate focal length")
+        })?;
+    let theta_rad = focal_probe[0] * PI / 180.0;
+    let focal_length = probe_height / theta_rad.tan();
+    if !focal_length.is_finite() || focal_length.abs() <= 1e-9 {
+        return Err(JsValue::from_str(
+            "run_native_distortion_wasm_json: invalid focal length",
+        ));
+    }
+
+    let magnification = if height_mode && finite_system {
+        let mag_probe = [1.0_f64];
+        let mag_probe_heights = distortion_compute_image_heights_via_lca_wasm(
+            &rows,
+            &source_rows,
+            &mag_probe,
+            wavelength,
+            surface_index,
+            true,
+        )?;
+        mag_probe_heights
+            .first()
+            .and_then(|v| *v)
+            .map(|y| y / 1.0_f64)
+            .unwrap_or(-1.0)
+    } else {
+        -1.0
+    };
+
+    let real_signed_heights = distortion_compute_image_heights_via_lca_wasm(
+        &rows,
+        &source_rows,
+        &field_values,
+        wavelength,
+        surface_index,
+        height_mode,
+    )?;
+    let real_heights: Vec<Option<f64>> = real_signed_heights
+        .iter()
+        .map(|v| v.map(|x| x.abs()))
+        .collect();
+
+    let ideal_heights: Vec<f64> = field_values
+        .iter()
+        .map(|sample| {
+            if height_mode {
+                if finite_system {
+                    magnification * *sample
+                } else {
+                    *sample
+                }
+            } else {
+                focal_length * ((*sample) * PI / 180.0).tan()
+            }
+        })
+        .collect();
+
+    let distortion: Vec<Option<f64>> = ideal_heights
+        .iter()
+        .enumerate()
+        .map(|(idx, h_ideal)| {
+            if h_ideal.abs() < 1e-12 {
+                Some(0.0)
+            } else if let Some(h_real) = real_heights[idx] {
+                Some((h_real - *h_ideal) / *h_ideal)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let distortion_percent: Vec<Option<f64>> = distortion.iter().map(|v| v.map(|x| x * 100.0)).collect();
+
+    let real_heights_json: Vec<Value> = real_heights
+        .iter()
+        .map(|v| match v {
+            Some(x) => Value::from(*x),
+            None => Value::Null,
+        })
+        .collect();
+    let distortion_json: Vec<Value> = distortion
+        .iter()
+        .map(|v| match v {
+            Some(x) => Value::from(*x),
+            None => Value::Null,
+        })
+        .collect();
+    let distortion_percent_json: Vec<Value> = distortion_percent
+        .iter()
+        .map(|v| match v {
+            Some(x) => Value::from(*x),
+            None => Value::Null,
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "backend": "native-rust-distortion-wasm",
+        "fieldValues": field_values,
+        "idealHeights": ideal_heights,
+        "realHeights": real_heights_json,
+        "distortion": distortion_json,
+        "distortionPercent": distortion_percent_json,
+        "meta": {
+            "wavelength": wavelength,
+            "focalLength": focal_length,
+            "finiteSystem": finite_system,
+            "heightMode": height_mode,
+            "magnification": magnification,
+            "mirrorSign": mirror_sign,
+            "surfaceIndex": surface_index,
+            "source": "run_native_distortion_wasm_json"
+        },
+        "message": "Computed via Rust/WASM direct native-parity distortion path"
+    });
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|err| JsValue::from_str(&format!("serialize error: {}", err)))?;
+    Ok(JsValue::from_str(&response_json))
+}
+
 #[wasm_bindgen]
 pub fn compute_lca_series_from_image_heights(
     field_values: &[f64],
@@ -5513,6 +6733,7 @@ pub fn compute_lca_series_from_image_heights(
     reference_wavelength: f64,
     image_heights_flat: &[f64],
 ) -> Result<JsValue, JsValue> {
+    let wavelength_eq_tol = 1.0e-4_f64;
     let field_len = field_values.len();
     let wl_len = wavelengths.len();
     if field_len == 0 || wl_len == 0 {
@@ -5524,7 +6745,7 @@ pub fn compute_lca_series_from_image_heights(
 
     let reference_index = wavelengths
         .iter()
-        .position(|w| (*w - reference_wavelength).abs() < 1e-9)
+        .position(|w| (*w - reference_wavelength).abs() < wavelength_eq_tol)
         .ok_or_else(|| JsValue::from_str("compute_lca_series_from_image_heights: reference wavelength not found"))?;
 
     let mut reference_heights = vec![None; field_len];

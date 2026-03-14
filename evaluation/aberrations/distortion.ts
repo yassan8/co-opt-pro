@@ -345,19 +345,16 @@ export async function calculateDistortionData(opticalSystemRows, fieldSamples, w
   };
 
   try {
-    const runtime = await import('../../src/desktop/runtime.ts');
-    const useNative = runtime?.isTauriRuntime && runtime.isTauriRuntime();
+    const { runNativeDistortion } = await import('../../src/desktop/ipc/client.ts');
+    try { onProgress?.({ percent: 0, message: 'Running distortion...' }); } catch (_) {}
+    const response = await runNativeDistortion({
+      opticalSystemRows,
+      fieldSamples,
+      heightMode,
+      wavelength,
+    });
 
-    if (useNative) {
-      const { runNativeDistortion } = await import('../../src/desktop/ipc/client.ts');
-      try { onProgress?.({ percent: 0, message: 'Running native distortion...' }); } catch (_) {}
-      const response = await runNativeDistortion({
-        opticalSystemRows,
-        fieldSamples,
-        heightMode,
-        wavelength,
-      });
-
+    if (response && typeof response === 'object') {
       return {
         fieldValues: Array.isArray(response?.fieldValues) ? response.fieldValues : fieldSamples,
         idealHeights: Array.isArray(response?.idealHeights) ? response.idealHeights : [],
@@ -368,7 +365,7 @@ export async function calculateDistortionData(opticalSystemRows, fieldSamples, w
       };
     }
 
-    try { onProgress?.({ percent: 0, message: 'Running Web distortion...' }); } catch (_) {}
+    try { onProgress?.({ percent: 0, message: 'Running Web distortion fallback...' }); } catch (_) {}
 
     const fieldValues = fieldSamples
       .map((v) => Number(v))
@@ -492,21 +489,18 @@ export async function calculateGridDistortion(opticalSystemRows, gridSize = 20, 
   };
 
   try {
-    const runtime = await import('../../src/desktop/runtime.ts');
-    const useNative = runtime?.isTauriRuntime && runtime.isTauriRuntime();
+    const { runNativeGridDistortion } = await import('../../src/desktop/ipc/client.ts');
+    let objectRows = [];
+    try { objectRows = getObjectRowsLocal(); } catch (_) { objectRows = []; }
+    try { onProgress?.({ percent: 0, message: 'Running grid distortion...' }); } catch (_) {}
+    const response = await runNativeGridDistortion({
+      opticalSystemRows,
+      objectRows: Array.isArray(objectRows) ? objectRows : [],
+      gridSize,
+      wavelength,
+    });
 
-    if (useNative) {
-      const { runNativeGridDistortion } = await import('../../src/desktop/ipc/client.ts');
-      let objectRows = [];
-      try { objectRows = getObjectRowsLocal(); } catch (_) { objectRows = []; }
-      try { onProgress?.({ percent: 0, message: 'Running native grid distortion...' }); } catch (_) {}
-      const response = await runNativeGridDistortion({
-        opticalSystemRows,
-        objectRows: Array.isArray(objectRows) ? objectRows : [],
-        gridSize,
-        wavelength,
-      });
-
+    if (response && typeof response === 'object') {
       return {
         idealGrid: {
           x: Array.isArray(response?.idealX) ? response.idealX : [],
